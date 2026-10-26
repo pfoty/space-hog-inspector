@@ -1,5 +1,6 @@
-// Draws the Space Hog Inspector app icon (a treemap with a pig snout)
-// and writes it as a 1024x1024 PNG to the path given as the first argument.
+// Draws the Space Hog Inspector app icon (the header's hexagon logo on a
+// dark rounded square) and writes it as a 1024x1024 PNG to the path given as
+// the first argument.
 import AppKit
 
 let size: CGFloat = 1024
@@ -12,42 +13,63 @@ let rep = NSBitmapImageRep(
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 
-func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
-    NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
 }
+let cyan = color(0x19E3FF)
+let magenta = color(0xFF2E88)
 
 // Rounded-square background, inset like standard macOS icons.
 let inset: CGFloat = 100
 let bg = NSRect(x: inset, y: inset, width: size - 2 * inset, height: size - 2 * inset)
 let bgPath = NSBezierPath(roundedRect: bg, xRadius: 185, yRadius: 185)
-NSGradient(starting: color(44, 52, 72), ending: color(22, 26, 38))!.draw(in: bgPath, angle: -90)
+color(0x0E1017).setFill()
+bgPath.fill()
+color(0x262A38).setStroke()
+bgPath.lineWidth = 6
+bgPath.stroke()
 
-// Treemap tiles.
-let pad: CGFloat = 70
-let area = bg.insetBy(dx: pad, dy: pad)
-let gap: CGFloat = 14
-func tile(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ c: NSColor) {
-    let r = NSRect(x: area.minX + x * area.width + gap / 2, y: area.minY + y * area.height + gap / 2,
-                   width: w * area.width - gap, height: h * area.height - gap)
-    c.setFill()
-    NSBezierPath(roundedRect: r, xRadius: 26, yRadius: 26).fill()
+// The logo, on the same 32-unit grid the app draws it on (y grows downward
+// there, so flip it here).
+let logo: CGFloat = 600
+let s = logo / 32
+let origin = CGPoint(x: (size - logo) / 2, y: (size + logo) / 2)
+func p(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: origin.x + x * s, y: origin.y - y * s) }
+
+func glow(_ c: NSColor, _ blur: CGFloat, _ draw: () -> Void) {
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow()
+    shadow.shadowColor = c
+    shadow.shadowBlurRadius = blur
+    shadow.shadowOffset = .zero
+    shadow.set()
+    draw()
+    NSGraphicsContext.restoreGraphicsState()
 }
-// Big pink "hog" tile on the left, smaller tiles on the right.
-tile(0.0, 0.0, 0.62, 1.0, color(240, 140, 170))
-tile(0.62, 0.55, 0.38, 0.45, color(96, 164, 232))
-tile(0.62, 0.25, 0.22, 0.30, color(110, 196, 124))
-tile(0.84, 0.25, 0.16, 0.30, color(222, 198, 84))
-tile(0.62, 0.0, 0.38, 0.25, color(178, 132, 222))
 
-// Pig snout in the big tile.
-let cx = area.minX + 0.31 * area.width
-let cy = area.minY + 0.5 * area.height
-let snout = NSRect(x: cx - 150, y: cy - 110, width: 300, height: 220)
-color(214, 98, 136).setFill()
-NSBezierPath(ovalIn: snout).fill()
-color(120, 40, 70).setFill()
-NSBezierPath(ovalIn: NSRect(x: cx - 85, y: cy - 45, width: 55, height: 90)).fill()
-NSBezierPath(ovalIn: NSRect(x: cx + 30, y: cy - 45, width: 55, height: 90)).fill()
+let hex = NSBezierPath()
+hex.move(to: p(16, 2))
+for (x, y) in [(28.0, 9.0), (28.0, 23.0), (16.0, 30.0), (4.0, 23.0), (4.0, 9.0)] {
+    hex.line(to: p(CGFloat(x), CGFloat(y)))
+}
+hex.close()
+hex.lineWidth = 1.5 * s
+hex.lineJoinStyle = .miter
+cyan.setStroke()
+glow(color(0x19E3FF, 0.8), 40) { hex.stroke() }
+hex.stroke()
+
+for (y, x2) in [(13.0, 22.0), (17.0, 18.0), (21.0, 15.0)] {
+    let bar = NSBezierPath()
+    bar.move(to: p(10, CGFloat(y)))
+    bar.line(to: p(CGFloat(x2), CGFloat(y)))
+    bar.lineWidth = 2 * s
+    bar.lineCapStyle = .square
+    magenta.setStroke()
+    glow(color(0xFF2E88, 0.7), 30) { bar.stroke() }
+    bar.stroke()
+}
 
 NSGraphicsContext.restoreGraphicsState()
 let data = rep.representation(using: .png, properties: [:])!

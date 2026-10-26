@@ -4,6 +4,13 @@ A native macOS app, written in Rust, that shows where your disk space goes.
 It is similar to SpaceSniffer: a scan draws your folders as a treemap, a set
 of nested boxes where each box's area is how much disk space it takes up.
 
+## Look
+
+The interface uses a Neo-Noir Cyberpunk style: an always-dark palette with
+cyan, magenta and yellow neon accents, cut-corner panels, and three bundled
+typefaces (Chakra Petch for headings, Inter for text, JetBrains Mono for
+numbers and paths).
+
 ## Features
 
 - **Fast parallel scan** on all CPU cores. The treemap fills in as each
@@ -23,10 +30,15 @@ of nested boxes where each box's area is how much disk space it takes up.
   Open, Copy Path, and **Move to Trash…**, which always asks first. Nothing is
   ever deleted permanently: you can restore items from the Trash in Finder.
 - **Status bar**: the scan total, how long it took, the volume's free and
-  total space, and a list of items macOS wouldn't let it read.
+  total space, and a list of items that were skipped or that macOS wouldn't
+  let it read.
+- **Settings** (menu bar **Space Hog Inspector → Settings…**, `Cmd+,`, or the
+  toolbar button): Full Disk Access status and setup, whether to skip folders
+  that trigger macOS permission prompts, and scan defaults. Settings are saved
+  to `~/Library/Application Support/Space Hog Inspector/settings.json`.
 
-Keyboard: `Cmd+O` choose a folder · `Cmd+R` rescan · `Backspace` /
-`Cmd+↑` go up a level.
+Keyboard: `Cmd+O` choose a folder · `Cmd+R` rescan · `Cmd+,` settings ·
+`Backspace` / `Cmd+↑` go up a level.
 
 ## Build
 
@@ -40,6 +52,12 @@ packaging/bundle.sh
 
 This builds an optimised binary and produces
 `target/release/Space Hog Inspector.app`. Drag it into `/Applications`.
+
+The script signs the app with your first "Apple Development" certificate if
+you have one (set `SIGN_IDENTITY` to choose another, or `SIGN_IDENTITY=-` for
+an ad-hoc signature). macOS ties Full Disk Access to the signature: with a
+certificate the grant survives rebuilds, with an ad-hoc signature it has to
+be granted again after every build.
 
 For development:
 
@@ -55,15 +73,23 @@ cargo test
 
 ## Full Disk Access
 
-macOS privacy protection hides some folders (Mail, Messages, Safari, Photos
-libraries, other users' homes, Time Machine data) from apps until you allow
-it. Without access those folders show up empty and are listed under
-"items couldn't be read" in the status bar.
+Without Full Disk Access, macOS asks separately before the app can read
+Desktop, Documents, Downloads, iCloud Drive, other apps' data, cloud storage
+folders and external drives, and hides Mail, Messages and Safari data
+completely. Turning on Full Disk Access once covers all of them, with no
+prompts.
 
-To see everything, open **System Settings → Privacy & Security → Full Disk
-Access**, add `Space Hog Inspector.app` and switch it on, then quit and
-reopen the app. The welcome screen and the unreadable-items list both have a
-link to that settings page.
+Open **Settings** in the app. It shows whether access is granted and has
+buttons to open the Full Disk Access page in System Settings, show the app in
+Finder (to drag it into the list), and relaunch, which macOS needs before the
+change applies.
+
+Until access is granted, the **Skip folders that would make macOS ask for
+permission** setting (on by default) leaves those folders out of scans, so
+you never get a stream of prompts. Skipped folders are listed under
+"skipped or unreadable" in the status bar. Turn the setting off to let macOS
+ask for each folder instead. A folder you pick to scan yourself is never
+skipped.
 
 ## Notes on the numbers
 
@@ -81,5 +107,8 @@ link to that settings page.
 | --- | --- |
 | `src/scanner.rs` | Parallel directory walk, size tree, file type classification |
 | `src/treemap.rs` | Squarified treemap layout |
-| `src/app.rs` | The egui interface: toolbar, treemap, side panel, dialogs |
+| `src/app.rs` | The egui interface: toolbar, treemap, side panel, dialogs, Settings window |
+| `src/settings.rs` | Saved settings, Full Disk Access check, relaunch helpers |
+| `src/theme.rs` | Colours, fonts, egui styling, and the neon drawing helpers and controls |
+| `assets/fonts/` | Chakra Petch, Inter and JetBrains Mono, each with its SIL Open Font License (`OFL-*.txt`) |
 | `packaging/` | `bundle.sh`, `Info.plist`, and the icon generator |

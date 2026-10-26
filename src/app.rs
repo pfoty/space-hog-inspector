@@ -1,26 +1,35 @@
-//! The Space Hog Inspector window: toolbar, treemap, item list and status bar.
+//! The Space Hog Inspector window: header, treemap, side panel, status bar,
+//! start screen and dialogs, drawn in the Neo-Noir Cyberpunk style.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Painter, Pos2, Rect,
-    RichText, Sense, Stroke, StrokeKind, Ui, vec2,
+    self, Align, Align2, Color32, Frame, Id, Key, LayerId, Layout, Margin, Order, Painter, Pos2, Rect,
+    RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 
-use crate::scanner::{self, Kind, Node, Progress, ScanMsg, ScanOptions, format_size};
+use crate::scanner::{self, Kind, Node, ProtectedPaths, Progress, ScanMsg, ScanOptions, format_size};
+use crate::settings::{self, Settings};
+use crate::theme::{
+    self, BG, BORDER, Button, CYAN, CYAN_DEEP, DIM, GREEN, GREY, Icon, MAGENTA, MAGENTA_DEEP, MAGENTA_SOFT,
+    MUTED, PANEL, RAISED, SURFACE, TEXT, TRACK, Tone, YELLOW, YELLOW_DEEP, body, body_medium, body_semibold,
+    display, display_bold, mono, mono_medium,
+};
 use crate::treemap::squarify;
 
-const HEADER_H: f32 = 16.0;
-const ROW_H: f32 = 22.0;
+const ROW_H: f32 = 40.0;
 /// Smallest area, in square points, an item gets its own rectangle.
 const MIN_ITEM_AREA: f32 = 12.0;
-const FULL_DISK_ACCESS_URL: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+/// Menu-bar item id for Settings…
+pub const MENU_SETTINGS: &str = "settings";
+/// Lines kept in the scan telemetry log.
+const LOG_LINES: usize = 5;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum SideTab {
@@ -44,6 +53,8 @@ struct ActiveScan {
     rx: Receiver<ScanMsg>,
     progress: Arc<Progress>,
     started: Instant,
+    /// Recently read folders, newest last.
+    log: VecDeque<String>,
 }
 
 struct TrashRequest {
@@ -52,6 +63,8 @@ struct TrashRequest {
     name: String,
     size: u64,
     is_dir: bool,
+    kind: Kind,
+    files: u64,
 }
 
 struct LargestCache {
@@ -61,8 +74,16 @@ struct LargestCache {
     rows: Vec<(Vec<usize>, Box<str>, u64, String)>,
 }
 
+/// How the path bar names the scan root: the folders above it, which
+/// aren't part of the scan, and the root's own label.
+struct RootCrumbs {
+    above: Vec<String>,
+    label: String,
+}
+
 pub struct SpaceHogApp {
     root_path: Option<PathBuf>,
+    root_crumbs: RootCrumbs,
     tree: Option<Node>,
     /// Index path from the tree root to the folder filling the treemap.
     view: Vec<usize>,
@@ -70,8 +91,18 @@ pub struct SpaceHogApp {
     scan: Option<ActiveScan>,
     /// Bumped whenever the tree changes, to invalidate caches.
     generation: u64,
-    max_depth: usize,
-    cross_volumes: bool,
+    settings: Settings,
+    /// Last settings written to disk, to save only on change.
+    saved_settings: Settings,
+    show_settings: bool,
+    /// Whether this app has Full Disk Access (checked at start, before each
+    /// scan, and on demand from Settings).
+    full_disk_access: bool,
+    /// Name of the startup disk, e.g. "Macintosh HD".
+    startup_name: String,
+    /// Kept alive so the menu bar stays installed.
+    _menu: muda::Menu,
+    menu_events: Receiver<muda::MenuEvent>,
     filter: String,
     side_tab: SideTab,
     largest: Option<LargestCache>,
@@ -84,16 +115,30 @@ pub struct SpaceHogApp {
 }
 
 impl SpaceHogApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial: Option<PathBuf>,
+        menu: muda::Menu,
+        menu_events: Receiver<muda::MenuEvent>,
+    ) -> Self {
+        theme::install(&cc.egui_ctx);
+        let settings = Settings::load();
+        let startup_name = startup_volume_name();
         let mut app = SpaceHogApp {
             root_path: None,
+            root_crumbs: RootCrumbs { above: Vec::new(), label: String::new() },
             tree: None,
             view: Vec::new(),
             selected: None,
             scan: None,
             generation: 0,
-            max_depth: 6,
-            cross_volumes: false,
+            saved_settings: settings.clone(),
+            settings,
+            show_settings: false,
+            full_disk_access: settings::has_full_disk_access(),
+            startup_name,
+            _menu: menu,
+            menu_events,
             filter: String::new(),
             side_tab: SideTab::Contents,
             largest: None,
@@ -115,7 +160,11 @@ impl SpaceHogApp {
         let path = path.canonicalize().unwrap_or(path);
         let progress = Arc::new(Progress::default());
         let (tx, rx) = mpsc::channel();
-        let options = ScanOptions { cross_volumes: self.cross_volumes };
+        self.full_disk_access = settings::has_full_disk_access();
+        let skip = (self.settings.skip_protected && !self.full_disk_access)
+            .then(|| std::env::var_os("HOME").map(|h| ProtectedPaths::for_home(Path::new(&h))))
+            .flatten();
+        let options = ScanOptions { cross_volumes: self.settings.cross_volumes, skip };
         let thread_progress = progress.clone();
         let thread_path = path.clone();
         let repaint = ctx.clone();
@@ -123,6 +172,7 @@ impl SpaceHogApp {
             scanner::scan(&thread_path, options, &thread_progress, &tx);
             repaint.request_repaint();
         });
+        self.root_crumbs = root_crumbs(&path, &self.startup_name);
         self.tree = Some(Node::dir(path.display().to_string(), Vec::new()));
         self.root_path = Some(path);
         self.view.clear();
@@ -133,7 +183,7 @@ impl SpaceHogApp {
         self.error_count = 0;
         self.error_paths.clear();
         self.generation += 1;
-        self.scan = Some(ActiveScan { rx, progress, started: Instant::now() });
+        self.scan = Some(ActiveScan { rx, progress, started: Instant::now(), log: VecDeque::new() });
     }
 
     fn stop_scan(&mut self) {
@@ -144,7 +194,16 @@ impl SpaceHogApp {
 
     /// Pulls finished entries from the scan thread into the tree.
     fn poll_scan(&mut self, ctx: &egui::Context) {
-        let Some(scan) = &self.scan else { return };
+        let Some(scan) = &mut self.scan else { return };
+        if let Ok(current) = scan.progress.current.lock() {
+            let line = tilde(&current);
+            if !current.as_os_str().is_empty() && scan.log.back() != Some(&line) {
+                scan.log.push_back(line);
+                if scan.log.len() > LOG_LINES {
+                    scan.log.pop_front();
+                }
+            }
+        }
         let mut done = false;
         let deadline = Instant::now() + Duration::from_millis(12);
         while Instant::now() < deadline {
@@ -245,6 +304,8 @@ impl SpaceHogApp {
                         name: node.name.to_string(),
                         size: node.size,
                         is_dir: node.is_dir,
+                        kind: node.kind,
+                        files: node.files,
                         fs_path,
                         path,
                     });
@@ -286,239 +347,564 @@ impl SpaceHogApp {
         ));
     }
 
-    // ---------------------------------------------------------------- UI --
+    // ------------------------------------------------------------ header --
 
-    fn toolbar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    fn header(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            if ui.button("Home").on_hover_text("Scan your home folder").clicked()
-                && let Some(home) = std::env::var_os("HOME")
-            {
-                self.start_scan(PathBuf::from(home), &ctx);
-            }
-            if ui.button("Whole Disk").on_hover_text("Scan the startup disk (/)").clicked() {
-                self.start_scan(PathBuf::from("/"), &ctx);
-            }
-            if ui.button("Choose Folder…").on_hover_text("Cmd+O").clicked() {
-                self.choose_folder(&ctx);
-            }
-            let can_rescan = self.root_path.is_some() && !self.scanning();
-            if ui.add_enabled(can_rescan, egui::Button::new("Rescan")).on_hover_text("Cmd+R").clicked()
-                && let Some(p) = self.root_path.clone()
-            {
-                self.start_scan(p, &ctx);
-            }
-            if self.scanning() && ui.button("Stop").clicked() {
-                self.stop_scan();
-            }
-            ui.separator();
-            ui.checkbox(&mut self.cross_volumes, "Include other volumes")
-                .on_hover_text("Also descend into external drives and network shares mounted inside the scanned folder. Applies to the next scan.");
-            ui.separator();
-            ui.add(egui::Slider::new(&mut self.max_depth, 1..=12).text("levels shown"));
-        });
+        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 18.0, None, Margin::symmetric(16, 10), |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                let (logo, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                theme::icon(ui.painter(), logo, Icon::Logo, CYAN);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(RichText::new("SPACE//HOG").font(display_bold(17.0)).color(TEXT).extra_letter_spacing(1.4));
+                    ui.label(RichText::new("INSPECTOR v1").font(mono(10.0)).color(MUTED).extra_letter_spacing(2.0));
+                });
+                let (rule, _) = ui.allocate_exact_size(vec2(1.0, 40.0), Sense::hover());
+                ui.painter().rect_filled(rule, 0.0, BORDER);
 
+                if let Some(scan) = &self.scan {
+                    let stop = Button::new("Stop scan", Tone::Outline(MAGENTA)).icon(Icon::Stop).shortcut("Esc").show(ui);
+                    let (total, done) = (
+                        scan.progress.top_total.load(Ordering::Relaxed),
+                        scan.progress.top_done.load(Ordering::Relaxed),
+                    );
+                    if stop.clicked() {
+                        self.stop_scan();
+                    }
+                    theme::caption(ui, "NODES", MUTED);
+                    let count = format!("{done}/{total}");
+                    let width = (ui.available_width() - 120.0).max(80.0);
+                    let (bar, _) = ui.allocate_exact_size(vec2(width, 12.0), Sense::hover());
+                    node_bar(ui.painter(), bar, done, total);
+                    ui.label(RichText::new(count).font(mono(13.0)).color(CYAN));
+                } else {
+                    if Button::new("Choose folder", Tone::Primary(MAGENTA))
+                        .icon(Icon::Folder)
+                        .shortcut("⌘O")
+                        .show(ui)
+                        .clicked()
+                    {
+                        self.choose_folder(&ctx);
+                    }
+                    let rescan = Button::new("Rescan", Tone::Outline(CYAN))
+                        .icon(Icon::Rescan)
+                        .shortcut("⌘R")
+                        .enabled(self.root_path.is_some())
+                        .show(ui);
+                    if rescan.clicked()
+                        && let Some(p) = self.root_path.clone()
+                    {
+                        self.start_scan(p, &ctx);
+                    }
+                    theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(14, 6), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            theme::caption(ui, "DEPTH", MUTED);
+                            ui.add(egui::Slider::new(&mut self.settings.max_depth, 1..=12).show_value(false))
+                                .on_hover_text("How many nested levels the treemap draws");
+                            ui.label(RichText::new(format!("{:02}", self.settings.max_depth)).font(mono(13.0)).color(CYAN));
+                        });
+                    });
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::icon_button(ui, Icon::Gear, 40.0, "Settings (⌘,)").clicked() {
+                        self.open_settings();
+                    }
+                });
+            });
+        });
+    }
+
+    fn path_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let Some(tree) = &self.tree else { return };
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!self.view.is_empty(), egui::Button::new("⬆ Up")).clicked() {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let up = Button::new("Up", Tone::Ghost).icon(Icon::Up).height(36.0).enabled(!self.view.is_empty());
+            if up.show(ui).on_hover_text("Backspace or ⌘↑").clicked() {
                 actions.push(Action::Up);
+            }
+            ui.label(RichText::new(">").font(mono(13.0)).color(MUTED));
+            // Long prefixes keep their first and last two parts.
+            let above = &self.root_crumbs.above;
+            let shown: Vec<&str> = if above.len() > 4 {
+                let n = above.len();
+                vec![above[0].as_str(), "…", above[n - 2].as_str(), above[n - 1].as_str()]
+            } else {
+                above.iter().map(String::as_str).collect()
+            };
+            for name in shown {
+                ui.label(RichText::new(name).font(mono(13.0)).color(MUTED));
+                ui.label(RichText::new("/").font(mono(13.0)).color(DIM));
             }
             let mut node = tree;
             for depth in 0..=self.view.len() {
                 if depth > 0 {
-                    ui.label(RichText::new("›").weak());
+                    ui.label(RichText::new("/").font(mono(13.0)).color(DIM));
                     node = &node.children[self.view[depth - 1]];
                 }
-                let current = depth == self.view.len();
-                let text = RichText::new(&*node.name);
-                let text = if current { text.strong() } else { text };
-                if ui.add(egui::Button::new(text).frame(false)).clicked() && !current {
+                let name = if depth == 0 { self.root_crumbs.label.as_str() } else { &node.name };
+                if crumb(ui, name, depth == self.view.len()).clicked() && depth < self.view.len() {
                     actions.push(Action::ZoomTo(self.view[..depth].to_vec()));
                 }
             }
-            ui.label(RichText::new(format_size(node.size)).weak());
+            let (cursor, _) = ui.allocate_exact_size(vec2(8.0, 16.0), Sense::hover());
+            ui.painter().rect_filled(cursor, 0.0, CYAN);
         });
     }
+
+    // -------------------------------------------------------- status bar --
 
     fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            if let Some(scan) = &self.scan {
-                ui.spinner();
-                let p = &scan.progress;
-                let current = p.current.lock().map(|c| c.display().to_string()).unwrap_or_default();
-                ui.label(format!(
-                    "Scanning… {} files in {} folders, {} so far ({:.0}s)",
-                    p.files.load(Ordering::Relaxed),
-                    p.dirs.load(Ordering::Relaxed),
-                    format_size(p.bytes.load(Ordering::Relaxed)),
-                    scan.started.elapsed().as_secs_f32(),
-                ));
-                ui.add(egui::Label::new(RichText::new(current).weak()).truncate());
+        let framed = theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(16, 8), |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let (state, color) = match (&self.scan, self.last_scan) {
+                    (Some(_), _) => ("SCANNING", CYAN),
+                    (None, Some((_, true))) => ("STOPPED EARLY", YELLOW),
+                    (None, Some(_)) => ("SCAN COMPLETE", GREEN),
+                    (None, None) => ("READY", MUTED),
+                };
+                let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                theme::status_light(ui.painter(), light.center(), color);
+                ui.label(RichText::new(state).font(mono(12.0)).color(color).extra_letter_spacing(1.0));
+                ui.add_space(10.0);
+
+                if let Some(scan) = &self.scan {
+                    let p = &scan.progress;
+                    ui.label(RichText::new(format_size(p.bytes.load(Ordering::Relaxed))).font(mono(12.0)).color(TEXT));
+                    ui.label(RichText::new("so far in").font(mono(12.0)).color(MUTED));
+                    ui.label(RichText::new(group(p.files.load(Ordering::Relaxed))).font(mono(12.0)).color(TEXT));
+                    ui.label(RichText::new("files").font(mono(12.0)).color(MUTED));
+                } else if let (Some(tree), Some((elapsed, _))) = (&self.tree, self.last_scan) {
+                    ui.label(RichText::new(format_size(tree.size)).font(mono(12.0)).color(TEXT));
+                    ui.label(RichText::new("in").font(mono(12.0)).color(MUTED));
+                    ui.label(RichText::new(format!("{:.1} s", elapsed.as_secs_f32())).font(mono(12.0)).color(TEXT));
+                }
+                ui.add_space(10.0);
+
+                let volume_path = self.root_path.clone().unwrap_or_else(|| PathBuf::from("/"));
+                if let Some(vol) = volume_info(&volume_path) {
+                    ui.label(RichText::new(volume_display_name(&vol.mount, &self.startup_name).to_uppercase()).font(mono(12.0)).color(MUTED));
+                    let (bar, _) = ui.allocate_exact_size(vec2(180.0, 8.0), Sense::hover());
+                    usage_bar(ui.painter(), bar, vol.used_fraction());
+                    ui.label(RichText::new(format_size(vol.free)).font(mono(12.0)).color(TEXT));
+                    ui.label(RichText::new("free of").font(mono(12.0)).color(MUTED));
+                    ui.label(RichText::new(format_size(vol.total)).font(mono(12.0)).color(TEXT));
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.scan.is_none() && self.error_count > 0 {
+                        let label = format!("! {} {}", self.error_count, plural(self.error_count, "item skipped or unreadable", "items skipped or unreadable"));
+                        if Button::new(&label, Tone::Outline(YELLOW)).mono().small().show(ui).clicked() {
+                            self.show_errors = true;
+                        }
+                    }
+                    if let Some((message, is_error)) = self.message.clone() {
+                        if Button::new("Dismiss", Tone::Ghost).small().show(ui).clicked() {
+                            self.message = None;
+                        }
+                        let color = if is_error { MAGENTA } else { TEXT };
+                        ui.add(egui::Label::new(RichText::new(message).font(body(12.0)).color(color)).truncate());
+                    }
+                });
+            });
+        });
+        let r = framed.response.rect;
+        ui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, CYAN));
+    }
+
+    // -------------------------------------------------------- side panel --
+
+    fn side_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
+            ui.set_min_size(ui.available_size());
+            if self.scan.is_some() {
+                self.telemetry(ui);
                 return;
             }
-            if let Some((message, is_error)) = &self.message {
-                let text = RichText::new(message);
-                ui.label(if *is_error { text.color(ui.visuals().error_fg_color) } else { text });
-                if ui.small_button("Dismiss").clicked() {
-                    self.message = None;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let w = ui.available_width() / 2.0;
+                if theme::tab(ui, "CONTENTS", self.side_tab == SideTab::Contents, w).clicked() {
+                    self.side_tab = SideTab::Contents;
                 }
-                ui.separator();
-            }
-            if let (Some(tree), Some((elapsed, cancelled))) = (&self.tree, self.last_scan) {
-                ui.label(format!(
-                    "{} in {} files · scanned in {:.1}s{}",
-                    format_size(tree.size),
-                    tree.files,
-                    elapsed.as_secs_f32(),
-                    if cancelled { " (stopped early, totals incomplete)" } else { "" },
-                ));
-                if self.error_count > 0 {
-                    ui.separator();
-                    let link = ui.link(format!("{} items couldn't be read", self.error_count));
-                    if link.clicked() {
-                        self.show_errors = true;
-                    }
+                if theme::tab(ui, "LARGEST FILES", self.side_tab == SideTab::LargestFiles, w).clicked() {
+                    self.side_tab = SideTab::LargestFiles;
                 }
-            }
-            if let Some(root) = &self.root_path
-                && let Some((free, total)) = volume_space(root)
-            {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(format!("Disk: {} free of {}", format_size(free), format_size(total)));
+            });
+            ui.add_space(4.0);
+            theme::caption(ui, "FILTER BY NAME", MUTED);
+            theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(12, 9), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(">").font(mono(14.0)).color(CYAN));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .frame(Frame::NONE)
+                            .font(mono(14.0))
+                            .text_color(TEXT)
+                            .hint_text(RichText::new("node_modules").font(mono(14.0)).color(DIM))
+                            .desired_width(f32::INFINITY),
+                    );
                 });
+            });
+            ui.add_space(2.0);
+
+            let Some(tree) = &self.tree else { return };
+            let Some(view_node) = tree.at(&self.view) else { return };
+            let filter = self.filter.to_lowercase();
+            let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
+            let scanning = self.scan.is_some();
+
+            match self.side_tab {
+                SideTab::Contents => {
+                    let rows: Vec<usize> =
+                        (0..view_node.children.len()).filter(|&i| matches(&view_node.children[i].name)).collect();
+                    if rows.is_empty() {
+                        ui.label(RichText::new("No items.").color(MUTED));
+                    }
+                    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for &i in &rows[range] {
+                            let child = &view_node.children[i];
+                            let mut path = self.view.clone();
+                            path.push(i);
+                            let detail = if child.is_dir { format!("{} files", group(child.files)) } else { String::new() };
+                            item_row(ui, tree, &path, child, view_node.size, &detail, self.selected.as_ref(), scanning, actions);
+                        }
+                    });
+                }
+                SideTab::LargestFiles => {
+                    let stale =
+                        self.largest.as_ref().is_none_or(|c| c.view != self.view || c.generation != self.generation);
+                    if stale {
+                        let rows = view_node
+                            .largest_files(300)
+                            .into_iter()
+                            .map(|(rel, n)| {
+                                let mut abs = self.view.clone();
+                                abs.extend_from_slice(&rel);
+                                let parent = view_node.names_along(&rel[..rel.len() - 1]).join("/");
+                                (abs, n.name.clone(), n.size, parent)
+                            })
+                            .collect();
+                        self.largest = Some(LargestCache { view: self.view.clone(), generation: self.generation, rows });
+                    }
+                    let cache = self.largest.as_ref().unwrap();
+                    let rows: Vec<&(Vec<usize>, Box<str>, u64, String)> =
+                        cache.rows.iter().filter(|r| matches(&r.1)).collect();
+                    if rows.is_empty() {
+                        ui.label(RichText::new("No files.").color(MUTED));
+                    }
+                    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (path, _, _, parent) in &rows[range] {
+                            if let Some(node) = tree.at(path) {
+                                let detail = if parent.is_empty() { "./".to_string() } else { format!("{parent}/") };
+                                item_row(ui, tree, path, node, view_node.size, &detail, self.selected.as_ref(), scanning, actions);
+                            }
+                        }
+                    });
+                }
             }
         });
     }
 
-    fn side_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        ui.add_space(4.0);
+    /// The side panel while a scan runs: live counters and a short log.
+    fn telemetry(&self, ui: &mut Ui) {
+        let Some(scan) = &self.scan else { return };
+        let p = &scan.progress;
+        ui.spacing_mut().item_spacing.y = 12.0;
+        theme::caption(ui, "// TELEMETRY", MUTED);
+        theme::framed(ui, BG, Stroke::new(1.0, CYAN), 0.0, Some(CYAN), 16, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            theme::caption(ui, "MEASURED", MUTED);
+            let size = format_size(p.bytes.load(Ordering::Relaxed));
+            let (value, unit) = size.rsplit_once(' ').unwrap_or((&size, ""));
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
+            let painter = ui.painter();
+            let num = theme::glow_text(painter, row.left_center(), Align2::LEFT_CENTER, value, mono_medium(42.0), CYAN, 0.0);
+            theme::text(painter, pos2(num.right() + 8.0, num.bottom() - 8.0), Align2::LEFT_BOTTOM, unit, mono(18.0), TEXT, 0.0);
+            let t = scan.started.elapsed().as_secs_f32();
+            ui.label(RichText::new(format!("T+{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).font(mono(12.0)).color(MUTED));
+        });
+
+        let half = (ui.available_width() - 8.0) / 2.0;
+        let tiles = [
+            ("FILES", group(p.files.load(Ordering::Relaxed)), BORDER, TEXT),
+            ("FOLDERS", group(p.dirs.load(Ordering::Relaxed)), BORDER, TEXT),
+            ("CORES", format!("{} active", rayon::current_num_threads()), BORDER, TEXT),
+            ("SKIPPED", group(p.errors.load(Ordering::Relaxed)), YELLOW, YELLOW),
+        ];
+        for pair in tiles.chunks(2) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for (label, value, edge, color) in pair {
+                    ui.allocate_ui(vec2(half, 64.0), |ui| {
+                        theme::framed(ui, BG, Stroke::new(1.0, *edge), 0.0, None, Margin::symmetric(12, 10), |ui| {
+                            ui.set_width(half - 24.0);
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            let label_color = if *edge == YELLOW { YELLOW } else { MUTED };
+                            theme::caption(ui, label, label_color);
+                            ui.label(RichText::new(value).font(mono(18.0)).color(*color));
+                        });
+                    });
+                }
+            });
+        }
+
+        theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, 12, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            if scan.log.is_empty() {
+                ui.label(RichText::new("> starting…").font(mono(12.0)).color(MUTED));
+            }
+            let last = scan.log.len().saturating_sub(1);
+            for (i, line) in scan.log.iter().enumerate() {
+                let color = if i == last { CYAN } else { MUTED };
+                ui.add(egui::Label::new(RichText::new(format!("> read {line}")).font(mono(12.0)).color(color)).truncate());
+            }
+        });
+        ui.label(
+            RichText::new("Finished folders land on the map right away, so you can explore them while the rest are measured.")
+                .font(body(13.0))
+                .color(MUTED),
+        );
+    }
+
+    // ------------------------------------------------------ start screen --
+
+    fn start_screen(&mut self, ui: &mut Ui) {
+        let avail = ui.available_rect_before_wrap();
+        let volume = volume_info(Path::new("/"));
+        if avail.width() >= 960.0 {
+            let gap = 20.0;
+            let left_w = ((avail.width() - gap) * 0.45).floor();
+            let left = Rect::from_min_size(avail.min, vec2(left_w, avail.height()));
+            let right = Rect::from_min_max(pos2(left.right() + gap, avail.top()), avail.max);
+            ui.scope_builder(UiBuilder::new().max_rect(left), |ui| self.volume_card(ui, volume.as_ref(), left.size()));
+            ui.scope_builder(UiBuilder::new().max_rect(right), |ui| {
+                ui.add_space(((right.height() - 600.0) / 2.0).max(0.0));
+                self.targets(ui);
+            });
+        } else {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                self.volume_card(ui, volume.as_ref(), vec2(avail.width(), 560.0));
+                ui.add_space(20.0);
+                self.targets(ui);
+            });
+        }
+    }
+
+    fn volume_card(&self, ui: &mut Ui, volume: Option<&VolumeInfo>, size: egui::Vec2) {
+        theme::framed(ui, PANEL, Stroke::new(1.0, BORDER), 0.0, None, 28, |ui| {
+            let inner = size - vec2(56.0, 56.0);
+            ui.set_min_size(inner);
+            ui.set_max_width(inner.x);
+            ui.horizontal(|ui| {
+                theme::caption(ui, "// VOLUME", MUTED);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = match volume {
+                        Some(v) => format!("{} · {}", self.startup_name.to_uppercase(), v.fs_type.to_uppercase()),
+                        None => self.startup_name.to_uppercase(),
+                    };
+                    theme::caption(ui, &label, MUTED);
+                });
+            });
+            let Some(v) = volume else {
+                ui.label(RichText::new("Couldn't read the startup disk.").color(MUTED));
+                return;
+            };
+            let ring = (inner.x.min(inner.y - 170.0)).clamp(200.0, 380.0);
+            ui.add_space(((inner.y - ring - 150.0) / 2.0).max(8.0));
+            ui.vertical_centered(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(ring, ring), Sense::hover());
+                capacity_ring(ui.painter(), rect, v.used_fraction());
+            });
+            ui.add_space(20.0);
+            let tiles = [
+                ("USED", v.total.saturating_sub(v.free), MAGENTA),
+                ("FREE", v.free, BORDER),
+                ("TOTAL", v.total, BORDER),
+            ];
+            let width = inner.x.min(460.0);
+            ui.horizontal(|ui| {
+                ui.add_space((inner.x - width) / 2.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let tile_w = (width - 16.0) / 3.0;
+                for (label, value, edge) in tiles {
+                    theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 10), |ui| {
+                        ui.set_width(tile_w - 20.0);
+                        ui.vertical_centered(|ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            theme::caption(ui, label, if edge == MAGENTA { MAGENTA_SOFT } else { MUTED });
+                            ui.label(RichText::new(format_size(value)).font(mono(17.0)).color(TEXT));
+                        });
+                    });
+                }
+            });
+        });
+    }
+
+    fn targets(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let width = ui.available_width().min(640.0);
+        ui.set_max_width(width);
+        ui.spacing_mut().item_spacing.y = 16.0;
+        ui.label(RichText::new("> SELECT TARGET_").font(mono(12.0)).color(CYAN).extra_letter_spacing(1.7));
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(RichText::new("FIND WHAT'S EATING").font(display_bold(48.0)).color(TEXT));
+            let painter = ui.painter().clone();
+            let g = theme::galley(&painter, "YOUR DISK.", display_bold(48.0), 0.0, f32::INFINITY);
+            let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+            theme::glow_text(&painter, rect.min, Align2::LEFT_TOP, "YOUR DISK.", display_bold(48.0), MAGENTA, 0.0);
+        });
+        ui.label(
+            RichText::new("Pick something to scan. Folders become boxes sized by the space they take, so the heavy ones light up.")
+                .font(body(16.0))
+                .color(MUTED),
+        );
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let downloads = home.as_ref().map(|h| h.join("Downloads"));
+        let card_w = (width - 12.0) / 2.0;
+        let mut pick: Option<PathBuf> = None;
+        let mut choose = false;
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.side_tab, SideTab::Contents, "Contents");
-            ui.selectable_value(&mut self.side_tab, SideTab::LargestFiles, "Largest Files");
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let home_label = home.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+            if target_card(ui, card_w, Icon::Home, MAGENTA, "HOME FOLDER", &home_label, Some("SUGGESTED"), CardStyle::Suggested).clicked() {
+                pick = home.clone();
+            }
+            if target_card(ui, card_w, Icon::Disk, CYAN, "WHOLE DISK", &self.startup_name, None, CardStyle::Normal).clicked() {
+                pick = Some(PathBuf::from("/"));
+            }
         });
-        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter by name").desired_width(f32::INFINITY));
-        egui::CollapsingHeader::new("Colour key").default_open(false).show(ui, |ui| {
-            for kind in Kind::LEGEND {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let dl_label = downloads.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+            if target_card(ui, card_w, Icon::Download, CYAN, "DOWNLOADS", &dl_label, None, CardStyle::Normal).clicked() {
+                pick = downloads.clone();
+            }
+            if target_card(ui, card_w, Icon::FolderPlus, CYAN, "CHOOSE A FOLDER…", "⌘O", None, CardStyle::Dashed).clicked() {
+                choose = true;
+            }
+        });
+        if let Some(p) = pick {
+            self.start_scan(p, &ctx);
+        }
+        if choose {
+            self.choose_folder(&ctx);
+        }
+
+        if self.full_disk_access {
+            ui.horizontal(|ui| {
+                let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                theme::status_light(ui.painter(), light.center(), GREEN);
+                ui.label(
+                    RichText::new("FULL DISK ACCESS GRANTED · every folder can be scanned without prompts")
+                        .font(mono(12.0))
+                        .color(MUTED),
+                );
+            });
+        } else {
+            let mut setup = false;
+            theme::framed(ui, YELLOW_DEEP, Stroke::new(1.0, YELLOW), 0.0, None, Margin::symmetric(16, 12), |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                    ui.painter().rect_filled(r, 2.0, kind_color(kind));
-                    ui.label(kind.label());
+                    ui.label(RichText::new("!").font(mono_medium(14.0)).color(YELLOW));
+                    let rest = if self.settings.skip_protected {
+                        "Folders that would make macOS ask for permission are skipped."
+                    } else {
+                        "macOS may ask for permission folder by folder."
+                    };
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        setup = Button::new("Set up access", Tone::Outline(YELLOW)).height(36.0).size(13.0).show(ui).clicked();
+                        ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new("Full Disk Access is off.").font(body_semibold(14.0)).color(YELLOW));
+                            ui.label(RichText::new(rest).font(body(14.0)).color(TEXT));
+                        });
+                    });
                 });
-            }
-        });
-        ui.separator();
-
-        let Some(tree) = &self.tree else {
-            ui.label(RichText::new("Nothing scanned yet.").weak());
-            return;
-        };
-        let Some(view_node) = tree.at(&self.view) else { return };
-        let filter = self.filter.to_lowercase();
-        let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
-
-        match self.side_tab {
-            SideTab::Contents => {
-                let rows: Vec<usize> =
-                    (0..view_node.children.len()).filter(|&i| matches(&view_node.children[i].name)).collect();
-                if rows.is_empty() {
-                    ui.label(RichText::new("No items.").weak());
-                }
-                egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
-                    for &i in &rows[range] {
-                        let child = &view_node.children[i];
-                        let mut path = self.view.clone();
-                        path.push(i);
-                        let detail = if child.is_dir { format!("{} files", child.files) } else { String::new() };
-                        item_row(ui, tree, &path, child, view_node.size, &detail, self.selected.as_ref(), self.scanning(), actions);
-                    }
-                });
-            }
-            SideTab::LargestFiles => {
-                let stale = self.largest.as_ref().is_none_or(|c| c.view != self.view || c.generation != self.generation);
-                if stale {
-                    let rows = view_node
-                        .largest_files(300)
-                        .into_iter()
-                        .map(|(rel, n)| {
-                            let mut abs = self.view.clone();
-                            abs.extend_from_slice(&rel);
-                            let parent = view_node.names_along(&rel[..rel.len() - 1]).join("/");
-                            (abs, n.name.clone(), n.size, parent)
-                        })
-                        .collect();
-                    self.largest = Some(LargestCache { view: self.view.clone(), generation: self.generation, rows });
-                }
-                let cache = self.largest.as_ref().unwrap();
-                let rows: Vec<&(Vec<usize>, Box<str>, u64, String)> =
-                    cache.rows.iter().filter(|r| matches(&r.1)).collect();
-                if rows.is_empty() {
-                    ui.label(RichText::new("No files.").weak());
-                }
-                egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
-                    for (path, _, _, parent) in &rows[range] {
-                        if let Some(node) = tree.at(path) {
-                            let detail = if parent.is_empty() { "./".to_string() } else { format!("{parent}/") };
-                            item_row(ui, tree, path, node, view_node.size, &detail, self.selected.as_ref(), self.scanning(), actions);
-                        }
-                    }
-                });
+            });
+            if setup {
+                self.open_settings();
             }
         }
     }
 
-    fn welcome(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.25);
-            ui.heading(RichText::new("Space Hog Inspector").size(30.0).strong());
-            ui.add_space(6.0);
-            ui.label("Find out what is eating your disk space. Pick something to scan:");
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                let width = 3.0 * 150.0 + 2.0 * ui.spacing().item_spacing.x;
-                ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-                let size = vec2(150.0, 36.0);
-                if ui.add_sized(size, egui::Button::new("Home Folder")).clicked()
-                    && let Some(home) = std::env::var_os("HOME")
-                {
-                    self.start_scan(PathBuf::from(home), &ctx);
+    // ---------------------------------------------------------- treemap --
+
+    fn treemap_section(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        theme::framed(ui, PANEL, Stroke::new(1.0, BORDER), 0.0, None, 12, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let (title, right, right_color) = match (&self.tree, self.tree.as_ref().and_then(|t| t.at(&self.view))) {
+                (_, Some(node)) if self.scan.is_some() && self.view.is_empty() => {
+                    (String::from("// SECTOR MAP · MAPPING"), format!("{} · LIVE", format_size(node.size)), CYAN)
                 }
-                if ui.add_sized(size, egui::Button::new("Whole Disk")).clicked() {
-                    self.start_scan(PathBuf::from("/"), &ctx);
+                (_, Some(node)) => {
+                    let place = self.fs_path(&self.view).map(|p| tilde(&p)).unwrap_or_default();
+                    (
+                        format!("// SECTOR MAP · {place}"),
+                        format!("{} · {} {}", format_size(node.size), group(node.children.len() as u64), plural(node.children.len() as u64, "NODE", "NODES")),
+                        MUTED,
+                    )
                 }
-                if ui.add_sized(size, egui::Button::new("Choose Folder…")).clicked() {
-                    self.choose_folder(&ctx);
+                _ => (String::new(), String::new(), MUTED),
+            };
+            // Lay out the readout first so a long path truncates instead of
+            // running into it.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 16.0), Layout::right_to_left(Align::Center), |ui| {
+                theme::caption(ui, &right, right_color);
+                ui.add_space(16.0);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(title).font(mono(11.0)).color(MUTED).extra_letter_spacing(1.5)).truncate());
+                });
+            });
+            let height = ui.available_height() - 28.0;
+            self.treemap(ui, actions, height.max(80.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 18.0;
+                for (label, kind) in theme::LEGEND {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (sw, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        let st = theme::kind_style(kind);
+                        ui.painter().rect(sw, 0.0, st.fill, Stroke::new(1.0, st.edge), StrokeKind::Inside);
+                        theme::caption(ui, label, MUTED);
+                    });
                 }
             });
-            ui.add_space(24.0);
-            ui.label(RichText::new(
-                "To see inside protected folders (Mail, Messages, Photos, other users), give this app Full Disk Access.",
-            ).weak());
-            if ui.link("Open Full Disk Access settings").clicked() {
-                self.run_open(Command::new("open").arg(FULL_DISK_ACCESS_URL));
-            }
         });
     }
 
-    fn treemap(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
+    fn treemap(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, height: f32) {
+        let (response, painter) = ui.allocate_painter(vec2(ui.available_width(), height), Sense::click());
         let Some(tree) = &self.tree else { return };
         let Some(view_node) = tree.at(&self.view) else {
             self.view.clear();
             return;
         };
         let bounds = response.rect;
-        painter.rect_filled(bounds, 0.0, Color32::from_gray(24));
+        painter.rect_filled(bounds, 0.0, BG);
         if view_node.size == 0 {
-            let msg = if self.scanning() { "Scanning…" } else { "This folder is empty or couldn't be read." };
-            painter.text(bounds.center(), Align2::CENTER_CENTER, msg, FontId::proportional(16.0), Color32::GRAY);
+            let msg = if self.scanning() { "MAPPING_" } else { "EMPTY OR UNREADABLE" };
+            theme::text(&painter, bounds.center(), Align2::CENTER_CENTER, msg, mono(13.0), if self.scanning() { CYAN } else { MUTED }, 2.0);
             return;
         }
 
         let mut draw = TreemapDraw {
             painter: &painter,
             pointer: response.hover_pos(),
-            max_depth: self.max_depth,
+            max_depth: self.settings.max_depth,
             hit: None,
             selected: self.selected.as_deref(),
             selected_rect: None,
@@ -528,10 +914,14 @@ impl SpaceHogApp {
         let (hit, selected_rect) = (draw.hit.take(), draw.selected_rect);
 
         if let Some(r) = selected_rect {
-            painter.rect_stroke(r, 0.0, Stroke::new(2.5, Color32::WHITE), StrokeKind::Inside);
+            theme::edge_glow(&painter, r.shrink(1.0), CYAN);
+            painter.rect_stroke(r.shrink(1.0), 0.0, Stroke::new(2.0, CYAN), StrokeKind::Inside);
         }
         if let Some((_, r)) = &hit {
-            painter.rect_stroke(*r, 0.0, Stroke::new(1.5, Color32::from_rgb(255, 230, 120)), StrokeKind::Inside);
+            let r = r.shrink(1.5);
+            theme::edge_glow(&painter, r, MAGENTA);
+            painter.rect_filled(r, 0.0, theme::glow_color(MAGENTA, 0.08));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.5, MAGENTA), StrokeKind::Inside);
         }
 
         if response.clicked() {
@@ -545,39 +935,25 @@ impl SpaceHogApp {
         {
             actions.push(Action::ZoomTo(p.clone()));
         }
+        let target_id = Id::unique("context_target");
         if response.secondary_clicked()
             && let Some((p, _)) = &hit
         {
-            ui.ctx().data_mut(|d| d.insert_temp(Id::unique("context_target"), p.clone()));
+            ui.ctx().data_mut(|d| d.insert_temp(target_id, p.clone()));
             actions.push(Action::Select(p.clone()));
         }
 
-        let scanning = self.scanning();
-        let view_size = view_node.size;
-        let response = if let Some((p, _)) = &hit
+        let menu_open = response.context_menu_opened();
+        if !menu_open
+            && let (Some((p, _)), Some(pointer)) = (&hit, response.hover_pos())
             && let Some(node) = tree.at(p)
         {
             let full = self.fs_path(p).map(|f| f.display().to_string()).unwrap_or_default();
-            response.on_hover_ui_at_pointer(|ui| {
-                ui.label(RichText::new(&*node.name).strong());
-                ui.label(RichText::new(full).weak());
-                ui.label(format!(
-                    "{}  ·  {:.1}% of this view",
-                    format_size(node.size),
-                    100.0 * node.size as f64 / view_size.max(1) as f64
-                ));
-                if node.is_dir {
-                    ui.label(format!("{} files · {} items inside", node.files, node.children.len()));
-                } else {
-                    ui.label(node.kind.label());
-                }
-                ui.label(RichText::new("Double-click to zoom · right-click for actions").weak().small());
-            })
-        } else {
-            response
-        };
+            hover_card(ui.ctx(), pointer, node, &full, view_node.size);
+        }
 
-        let target: Option<Vec<usize>> = ui.ctx().data(|d| d.get_temp(Id::unique("context_target")));
+        let scanning = self.scanning();
+        let target: Option<Vec<usize>> = ui.ctx().data(|d| d.get_temp(target_id));
         response.context_menu(|ui| {
             if let Some(target) = &target {
                 context_menu_items(ui, tree, target, scanning, actions);
@@ -590,15 +966,23 @@ impl eframe::App for SpaceHogApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_scan(&ctx);
+        while let Ok(event) = self.menu_events.try_recv() {
+            if event.id.as_ref() == MENU_SETTINGS {
+                self.open_settings();
+            }
+        }
         let mut actions = Vec::new();
 
         if !ctx.egui_wants_keyboard_input() {
-            let (up, open, rescan) = ctx.input(|i| {
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Comma)) {
+                self.open_settings();
+            }
+            let (up, open, rescan, escape) = ctx.input(|i| {
                 (
-                    // Not Escape: that closes menus and dialogs.
                     i.key_pressed(Key::Backspace) || (i.modifiers.command && i.key_pressed(Key::ArrowUp)),
                     i.modifiers.command && i.key_pressed(Key::O),
                     i.modifiers.command && i.key_pressed(Key::R),
+                    i.key_pressed(Key::Escape),
                 )
             });
             if up {
@@ -613,96 +997,398 @@ impl eframe::App for SpaceHogApp {
             {
                 self.start_scan(p, &ctx);
             }
+            // Escape closes the topmost window; with none open it stops a
+            // scan. It never navigates, since it also closes menus.
+            if escape && self.trash_request.is_none() {
+                if self.show_settings {
+                    self.show_settings = false;
+                } else if self.show_errors {
+                    self.show_errors = false;
+                } else if self.scanning() {
+                    self.stop_scan();
+                }
+            }
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.toolbar(ui, &mut actions);
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.status_bar(ui);
-            ui.add_space(2.0);
-        });
-        if self.tree.is_some() {
-            egui::Panel::right("side").resizable(true).default_size(340.0).min_size(220.0).show(ui, |ui| {
-                self.side_panel(ui, &mut actions);
+        egui::Panel::top("header")
+            .frame(Frame::NONE.fill(BG).inner_margin(Margin { left: 16, right: 16, top: 14, bottom: 6 }))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                self.header(ui);
+                if self.tree.is_some() {
+                    ui.add_space(6.0);
+                    self.path_bar(ui, &mut actions);
+                }
             });
-        }
+        egui::Panel::bottom("status")
+            .frame(Frame::NONE.fill(BG).inner_margin(Margin { left: 16, right: 16, top: 6, bottom: 14 }))
+            .show_separator_line(false)
+            .show(ui, |ui| self.status_bar(ui));
         if self.tree.is_some() {
-            egui::CentralPanel::no_frame().show(ui, |ui| self.treemap(ui, &mut actions));
+            egui::Panel::right("side")
+                .frame(Frame::NONE.fill(BG).inner_margin(Margin { left: 0, right: 16, top: 6, bottom: 6 }))
+                .show_separator_line(false)
+                .resizable(true)
+                .default_size(360.0)
+                .min_size(280.0)
+                .show(ui, |ui| self.side_panel(ui, &mut actions));
+            egui::CentralPanel::default()
+                .frame(Frame::NONE.fill(BG).inner_margin(Margin { left: 16, right: 12, top: 6, bottom: 6 }))
+                .show(ui, |ui| self.treemap_section(ui, &mut actions));
         } else {
-            egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
+            egui::CentralPanel::default()
+                .frame(Frame::NONE.fill(BG).inner_margin(Margin { left: 16, right: 16, top: 14, bottom: 6 }))
+                .show(ui, |ui| self.start_screen(ui));
         }
 
         for action in actions {
             self.apply(action, &ctx);
         }
 
-        if let Some(request) = &self.trash_request {
-            let mut confirmed = false;
-            let mut cancelled = false;
-            let modal = egui::Modal::new(Id::unique("trash_modal")).show(&ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.heading("Move to Trash?");
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "Move the {} \"{}\" ({}) to the Trash?",
-                    if request.is_dir { "folder" } else { "file" },
-                    request.name,
-                    format_size(request.size)
-                ));
-                ui.label(RichText::new(request.fs_path.display().to_string()).weak());
-                ui.add_space(4.0);
-                ui.label("You can put it back from the Trash in Finder until the Trash is emptied.");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Move to Trash").color(ui.visuals().error_fg_color)).clicked() {
-                        confirmed = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
-                    }
-                });
-            });
-            if confirmed {
-                let request = self.trash_request.take().unwrap();
-                self.move_to_trash(request);
-            } else if cancelled || modal.should_close() {
-                self.trash_request = None;
+        self.trash_dialog(&ctx);
+        if self.show_errors {
+            self.errors_window(&ctx);
+        }
+        if self.show_settings {
+            self.settings_window(&ctx);
+        }
+        if self.settings != self.saved_settings {
+            self.save_settings();
+        }
+    }
+}
+
+// ----------------------------------------------------------- dialogs --
+
+impl SpaceHogApp {
+    fn open_settings(&mut self) {
+        self.show_settings = true;
+        self.full_disk_access = settings::has_full_disk_access();
+    }
+
+    fn save_settings(&mut self) {
+        match self.settings.save() {
+            Ok(()) => self.saved_settings = self.settings.clone(),
+            Err(e) => {
+                self.message = Some((format!("Couldn't save settings: {e}"), true));
+                // Don't retry every frame.
+                self.saved_settings = self.settings.clone();
             }
         }
+    }
 
-        if self.show_errors {
-            let mut open = true;
-            egui::Window::new("Items that couldn't be read").open(&mut open).default_size([560.0, 360.0]).show(&ctx, |ui| {
-                ui.label(format!(
-                    "{} items were skipped, usually because macOS privacy protection blocked access. \
-                     Their space is not included in the totals.{}",
-                    self.error_count,
-                    if self.error_count as usize > self.error_paths.len() {
+    fn trash_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = &self.trash_request else { return };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(Id::unique("trash_modal"))
+            .frame(Frame::NONE)
+            .backdrop_color(Color32::from_black_alpha(200))
+            .show(ctx, |ui| {
+                theme::framed(ui, SURFACE, Stroke::new(1.0, MAGENTA), 22.0, Some(MAGENTA), 26, |ui| {
+                    ui.set_width(520.0);
+                    ui.spacing_mut().item_spacing.y = 16.0;
+                    ui.horizontal(|ui| {
+                        theme::caption(ui, "// CONFIRM ACTION", MAGENTA);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| theme::caption(ui, "REVERSIBLE", MUTED));
+                    });
+                    ui.label(
+                        RichText::new(format!("Move “{}” to the Trash?", request.name)).font(display(22.0)).color(TEXT),
+                    );
+                    theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(16, 14), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.label(RichText::new(request.fs_path.display().to_string()).font(mono(12.0)).color(MUTED));
+                        ui.horizontal(|ui| {
+                            let st = theme::kind_style(if request.is_dir { Kind::Folder } else { request.kind });
+                            let (sw, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                            let edge = if request.is_dir { GREY } else { st.edge };
+                            ui.painter().rect(sw, 0.0, st.fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+                            let what = if request.is_dir {
+                                format!("Folder · {} {}", group(request.files), plural(request.files, "file", "files"))
+                            } else {
+                                request.kind.label().to_string()
+                            };
+                            ui.label(RichText::new(what).font(body(13.0)).color(TEXT));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let g = theme::galley(ui.painter(), format_size(request.size), mono_medium(24.0), 0.0, f32::INFINITY);
+                                let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                                theme::glow_text(ui.painter(), r.min, Align2::LEFT_TOP, format_size(request.size), mono_medium(24.0), CYAN, 0.0);
+                            });
+                        });
+                    });
+                    ui.label(
+                        RichText::new("Nothing is deleted for good. You can put it back from the Trash in Finder. The space is freed when you empty the Trash.")
+                            .font(body(14.0))
+                            .color(MUTED),
+                    );
+                    // Inside a row, so the right-aligned buttons don't claim
+                    // the rest of the dialog's height.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if Button::new("Move to Trash", Tone::Primary(MAGENTA)).height(44.0).show(ui).clicked() {
+                                confirmed = true;
+                            }
+                            if Button::new("Cancel", Tone::Ghost).height(44.0).show(ui).clicked() {
+                                cancelled = true;
+                            }
+                        });
+                    });
+                });
+            });
+        if confirmed {
+            let request = self.trash_request.take().unwrap();
+            self.move_to_trash(request);
+        } else if cancelled || modal.should_close() {
+            self.trash_request = None;
+        }
+    }
+
+    fn errors_window(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let mut open_settings = false;
+        egui::Window::new("skipped")
+            .title_bar(false)
+            .frame(Frame::NONE)
+            .resizable(false)
+            .auto_sized()
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                theme::framed(ui, SURFACE, Stroke::new(1.0, YELLOW), 18.0, None, 24, |ui| {
+                    ui.set_width(660.0);
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    ui.horizontal(|ui| {
+                        theme::caption(ui, "// SKIPPED OR UNREADABLE", YELLOW);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            theme::caption(ui, &group(self.error_count), YELLOW);
+                        });
+                    });
+                    let why = if self.full_disk_access {
+                        if self.error_count == 1 {
+                            "it couldn't be read (the reason is shown below it)"
+                        } else {
+                            "they couldn't be read (the reason is shown below each one)"
+                        }
+                    } else {
+                        "some were skipped to avoid macOS permission prompts and others were blocked by \
+                         macOS privacy protection"
+                    };
+                    let listed = if self.error_count as usize > self.error_paths.len() {
                         format!(" The first {} are listed.", self.error_paths.len())
                     } else {
                         String::new()
-                    }
-                ));
-                if ui.link("Open Full Disk Access settings").clicked() {
-                    let _ = Command::new("open").arg(FULL_DISK_ACCESS_URL).status();
-                }
-                ui.separator();
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    for (path, err) in &self.error_paths {
-                        ui.horizontal(|ui| {
-                            ui.label(path.display().to_string());
-                            ui.label(RichText::new(err).weak());
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {} left out of the totals because {why}.{listed}",
+                            group(self.error_count),
+                            plural(self.error_count, "item was", "items were"),
+                        ))
+                        .font(body(14.0))
+                        .color(MUTED),
+                    );
+                    theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, 12, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            for (path, err) in &self.error_paths {
+                                ui.label(RichText::new(tilde(path)).font(mono(12.0)).color(TEXT));
+                                ui.label(RichText::new(format!("  {err}")).font(mono(11.0)).color(MUTED));
+                            }
                         });
-                    }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            close = Button::new("Close", Tone::Ghost).height(40.0).show(ui).clicked();
+                            if !self.full_disk_access {
+                                open_settings = Button::new("Set up Full Disk Access", Tone::Outline(YELLOW)).height(40.0).show(ui).clicked();
+                            }
+                        });
+                    });
                 });
             });
-            self.show_errors = open;
+        if close {
+            self.show_errors = false;
+        }
+        if open_settings {
+            self.show_errors = false;
+            self.open_settings();
         }
     }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let mut relaunch = false;
+        egui::Window::new("settings")
+            .title_bar(false)
+            .frame(Frame::NONE)
+            .resizable(false)
+            .auto_sized()
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                theme::framed(ui, PANEL, Stroke::new(1.0, BORDER), 0.0, Some(CYAN), 32, |ui| {
+                    let width = 696.0;
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 18.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("SETTINGS").font(display_bold(26.0)).color(TEXT).extra_letter_spacing(2.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("⌘,").font(mono(12.0)).color(MUTED));
+                        });
+                    });
+                    let (rule, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
+                    ui.painter().rect_filled(rule, 0.0, BORDER);
+
+                    let (edge, status) = if self.full_disk_access { (GREEN, "GRANTED") } else { (YELLOW, "NOT GRANTED") };
+                    theme::framed(ui, BG, Stroke::new(1.0, edge), 18.0, None, 20, |ui| {
+                        ui.set_width(width - 40.0);
+                        ui.spacing_mut().item_spacing.y = 14.0;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("FULL DISK ACCESS").font(display(17.0)).color(TEXT).extra_letter_spacing(0.7));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if Button::new("Check again", Tone::Ghost).small().show(ui).clicked() {
+                                    self.full_disk_access = settings::has_full_disk_access();
+                                }
+                                // A fixed slot inside the right-to-left row keeps the
+                                // badge's reading order and its natural width.
+                                ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
+                                    ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
+                                        theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 6), |ui| {
+                                            ui.horizontal(|ui| {
+                                                let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                                theme::status_light(ui.painter(), light.center(), edge);
+                                                theme::caption(ui, status, edge);
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                        let about = if self.full_disk_access {
+                            "Space Hog Inspector can read every folder, and macOS won't ask for permission folder by folder."
+                        } else {
+                            "Without it, macOS asks separately before the app can read Desktop, Documents, Downloads, \
+                             iCloud Drive, other apps' data and external drives, and hides Mail, Messages and Safari \
+                             data completely. Turning it on once covers all of them."
+                        };
+                        ui.label(RichText::new(about).font(body(14.0)).color(MUTED));
+                        if !self.full_disk_access {
+                            let card_w = (width - 40.0 - 20.0) / 3.0;
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let steps = [
+                                    ("[01]", "Open the Full Disk Access list", "Open System Settings", true),
+                                    ("[02]", "Switch on Space Hog Inspector, or drag it into the list", "Show app in Finder", false),
+                                    ("[03]", "Relaunch so macOS applies the change", "Relaunch", false),
+                                ];
+                                for (i, (num, text, action, primary)) in steps.into_iter().enumerate() {
+                                    theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
+                                        ui.set_width(card_w - 28.0);
+                                        ui.spacing_mut().item_spacing.y = 10.0;
+                                        ui.label(RichText::new(num).font(mono(12.0)).color(CYAN));
+                                        ui.allocate_ui(vec2(card_w - 28.0, 36.0), |ui| {
+                                            ui.set_min_height(36.0);
+                                            ui.label(RichText::new(text).font(body(13.0)).color(TEXT));
+                                        });
+                                        let tone = if primary { Tone::Primary(CYAN) } else { Tone::Outline(CYAN) };
+                                        if Button::new(action, tone).size(12.0).width(card_w - 28.0).show(ui).clicked() {
+                                            match i {
+                                                0 => {
+                                                    if let Err(e) = settings::open_full_disk_access_settings() {
+                                                        self.message = Some((format!("Couldn't open System Settings: {e}"), true));
+                                                    }
+                                                }
+                                                1 => {
+                                                    if let Err(e) = settings::reveal_app_in_finder() {
+                                                        self.message = Some((format!("Couldn't open Finder: {e}"), true));
+                                                    }
+                                                }
+                                                _ => relaunch = true,
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+
+                    theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(20, 14), |ui| {
+                        ui.set_width(width - 40.0);
+                        ui.spacing_mut().item_spacing.y = 12.0;
+                        theme::caption(ui, "// SCANNING", MUTED);
+                        let skip_note = if self.full_disk_access {
+                            "Full Disk Access is on, so nothing needs to be skipped. A folder you pick yourself is never skipped."
+                        } else {
+                            "Only while Full Disk Access is off. Skipped folders are listed in the status bar. A folder you pick yourself is never skipped."
+                        };
+                        setting_switch(ui, "Skip folders that would make macOS ask for permission", skip_note, &mut self.settings.skip_protected);
+                        setting_switch(
+                            ui,
+                            "Include other mounted volumes",
+                            "Follow into external drives and network shares found inside the scanned folder.",
+                            &mut self.settings.cross_volumes,
+                        );
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui(vec2(width - 40.0 - 260.0, 48.0), |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    ui.label(RichText::new("Default treemap depth").font(body_medium(15.0)).color(TEXT));
+                                    ui.label(RichText::new("How many nested levels the treemap draws.").font(body(13.0)).color(MUTED));
+                                });
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.allocate_ui_with_layout(vec2(220.0, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                                    theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(14, 8), |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 12.0;
+                                            ui.add(egui::Slider::new(&mut self.settings.max_depth, 1..=12).show_value(false));
+                                            ui.label(RichText::new(format!("{:02}", self.settings.max_depth)).font(mono(13.0)).color(CYAN));
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        let path = Settings::file().map(|p| tilde(&p)).unwrap_or_default();
+                        ui.label(RichText::new(path).font(mono(11.0)).color(MUTED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            close = Button::new("Done", Tone::Outline(TEXT)).height(44.0).show(ui).clicked();
+                        });
+                    });
+                });
+            });
+        if close {
+            self.show_settings = false;
+        }
+        if relaunch {
+            self.save_settings();
+            match settings::launch_new_instance() {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.message = Some((format!("Couldn't relaunch: {e}"), true)),
+            }
+        }
+    }
+}
+
+/// One labelled on/off setting with a description, separated by a rule.
+fn setting_switch(ui: &mut Ui, title: &str, note: &str, value: &mut bool) {
+    let width = ui.available_width();
+    ui.horizontal(|ui| {
+        ui.allocate_ui(vec2(width - 80.0, 48.0), |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(RichText::new(title).font(body_medium(15.0)).color(TEXT));
+                ui.label(RichText::new(note).font(body(13.0)).color(MUTED));
+            });
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| theme::switch(ui, value, title));
+    });
+    let (rule, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
+    ui.painter().rect_filled(rule, 0.0, BORDER);
 }
 
 // ------------------------------------------------------------- drawing --
@@ -728,36 +1414,67 @@ impl TreemapDraw<'_> {
         if self.selected == Some(path.as_slice()) {
             self.selected_rect = Some(rect);
         }
+        // A small gap between neighbours keeps the boxes readable.
+        let gap = if depth == 0 { 0.0 } else if rect.width() > 12.0 && rect.height() > 12.0 { 1.5 } else { 0.5 };
+        let r = rect.shrink(gap);
         if node.is_dir {
-            self.folder(node, rect, depth, path);
+            self.folder(node, r, depth, path);
         } else {
-            self.file(node, rect);
+            self.file(node, r);
         }
     }
 
     fn folder(&mut self, node: &Node, rect: Rect, depth: usize, path: &mut Vec<usize>) {
-        let frame = folder_color(node.kind, depth);
-        self.painter.rect(rect, 0.0, frame, Stroke::new(1.0, Color32::from_gray(15)), StrokeKind::Inside);
-
-        let has_header = rect.width() >= 36.0 && rect.height() >= HEADER_H + 10.0;
-        let inner = if has_header {
-            let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
-            label(self.painter, header, &format!("{}  {}", node.name, format_size(node.size)), Color32::from_gray(235), 11.5);
-            Rect::from_min_max(rect.min + vec2(2.0, HEADER_H), rect.max - vec2(2.0, 2.0))
+        if depth == 0 {
+            // The folder being viewed fills the map; the path bar already
+            // names it, so lay its contents out directly.
+            self.children(node, rect, depth, path);
+            return;
+        }
+        let is_app = node.kind == Kind::App;
+        let (fill, edge) = if is_app {
+            let st = theme::kind_style(Kind::App);
+            (st.fill, st.edge.gamma_multiply(0.7))
         } else {
-            rect.shrink(1.0)
+            (SURFACE, BORDER)
+        };
+        self.painter.rect(rect, 0.0, fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+
+        let header_h = if depth <= 1 { 24.0 } else { 18.0 };
+        let has_header = rect.width() >= 40.0 && rect.height() >= header_h + 12.0;
+        let inner = if has_header {
+            let header = Rect::from_min_size(rect.min, vec2(rect.width(), header_h));
+            let clip = self.painter.with_clip_rect(header.shrink(1.0));
+            let size_font = mono(if depth <= 1 { 11.0 } else { 10.0 });
+            let name_font = display(if depth <= 1 { 12.0 } else { 11.0 });
+            let size = theme::galley(self.painter, format_size(node.size), size_font, 0.0, f32::INFINITY);
+            let name = theme::galley(self.painter, node.name.to_uppercase(), name_font, 0.9, f32::INFINITY);
+            let fits_size = name.size().x + size.size().x + 28.0 < header.width();
+            clip.galley(pos2(header.left() + 8.0, header.center().y - name.size().y / 2.0), name, if is_app { theme::kind_style(Kind::App).text } else { TEXT });
+            if fits_size {
+                clip.galley(pos2(header.right() - 8.0 - size.size().x, header.center().y - size.size().y / 2.0), size, MUTED);
+            }
+            self.painter.line_segment([header.left_bottom(), header.right_bottom()], Stroke::new(1.0, edge));
+            Rect::from_min_max(rect.min + vec2(2.0, header_h + 2.0), rect.max - vec2(2.0, 2.0))
+        } else {
+            rect.shrink(1.5)
         };
         if inner.width() < 2.0 || inner.height() < 2.0 || node.children.is_empty() {
             return;
         }
         if depth + 1 >= self.max_depth {
-            // Depth limit reached: show the contents as one solid block.
-            self.painter.rect_filled(inner, 0.0, frame.gamma_multiply(0.75));
-            if has_header {
-                label(self.painter, inner, &format!("{} items", node.children.len()), Color32::from_gray(190), 11.0);
+            // Depth limit reached: show the contents as one block.
+            self.painter.rect_filled(inner, 0.0, PANEL);
+            if has_header && inner.height() > 16.0 && inner.width() > 60.0 {
+                let label = format!("{} {}", group(node.children.len() as u64), plural(node.children.len() as u64, "ITEM", "ITEMS"));
+                theme::text(&self.painter.with_clip_rect(inner), inner.min + vec2(8.0, 6.0), Align2::LEFT_TOP, label, mono(10.0), MUTED, 1.0);
             }
             return;
         }
+        self.children(node, inner, depth, path);
+    }
+
+    fn children(&mut self, node: &Node, inner: Rect, depth: usize, path: &mut Vec<usize>) {
         let sizes: Vec<u64> = node.children.iter().map(|c| c.size).collect();
         let layout = squarify(&sizes, inner, MIN_ITEM_AREA);
         for (i, r) in layout.rects.iter().enumerate() {
@@ -766,63 +1483,216 @@ impl TreemapDraw<'_> {
             path.pop();
         }
         if let Some(rest) = layout.rest {
-            let count = node.children.len() - layout.rects.len();
-            self.painter.rect(rest, 0.0, Color32::from_gray(70), Stroke::new(1.0, Color32::from_gray(15)), StrokeKind::Inside);
-            label(self.painter, rest, &format!("{count} small items"), Color32::from_gray(200), 10.5);
+            let rest = rest.shrink(1.0);
+            self.painter.rect_filled(rest, 0.0, PANEL);
+            theme::dashed_rect(self.painter, rest, Stroke::new(1.0, DIM));
+            if rest.width() > 70.0 && rest.height() > 18.0 {
+                let count = node.children.len() - layout.rects.len();
+                let label = format!("{} SMALL {}", group(count as u64), plural(count as u64, "ITEM", "ITEMS"));
+                theme::text(&self.painter.with_clip_rect(rest), rest.min + vec2(6.0, 5.0), Align2::LEFT_TOP, label, mono(10.0), MUTED, 1.0);
+            }
         }
     }
 
     fn file(&mut self, node: &Node, rect: Rect) {
-        let base = kind_color(node.kind);
-        self.painter.rect(rect, 0.0, base, Stroke::new(1.0, Color32::from_black_alpha(140)), StrokeKind::Inside);
-        // A light band along the top gives each block a little depth.
-        if rect.height() > 6.0 {
-            let band = Rect::from_min_size(rect.min, vec2(rect.width(), (rect.height() * 0.35).min(14.0)));
-            self.painter.rect_filled(band.shrink(1.0), 0.0, Color32::from_white_alpha(28));
-        }
-        if rect.width() >= 40.0 && rect.height() >= 14.0 {
-            let text_color = Color32::from_black_alpha(230);
-            if rect.height() >= 30.0 {
-                label(self.painter, rect, &node.name, text_color, 11.0);
-                let lower = Rect::from_min_max(rect.min + vec2(0.0, 13.0), rect.max);
-                label(self.painter, lower, &format_size(node.size), text_color, 10.5);
+        let st = theme::kind_style(node.kind);
+        self.painter.rect(rect, 0.0, st.fill, Stroke::new(1.0, st.edge), StrokeKind::Inside);
+        if rect.width() >= 44.0 && rect.height() >= 18.0 {
+            let clip = self.painter.with_clip_rect(rect.shrink(2.0));
+            if rect.height() >= 36.0 {
+                theme::text(&clip, rect.min + vec2(8.0, 7.0), Align2::LEFT_TOP, node.name.to_string(), body_medium(12.0), st.text, 0.0);
+                theme::text(&clip, rect.min + vec2(8.0, 23.0), Align2::LEFT_TOP, format_size(node.size), mono(11.0), st.text, 0.0);
             } else {
-                label(self.painter, rect, &format!("{} {}", node.name, format_size(node.size)), text_color, 10.5);
+                let label = format!("{} {}", node.name, format_size(node.size));
+                theme::text(&clip, pos2(rect.left() + 6.0, rect.center().y), Align2::LEFT_CENTER, label, body_medium(11.0), st.text, 0.0);
             }
         }
     }
 }
 
-fn label(painter: &Painter, rect: Rect, text: &str, color: Color32, size: f32) {
-    painter.with_clip_rect(rect.shrink(1.0)).text(
-        rect.min + vec2(4.0, 2.0),
-        Align2::LEFT_TOP,
-        text,
-        FontId::proportional(size),
-        color,
-    );
+/// The "target lock" readout that follows the pointer over the treemap.
+fn hover_card(ctx: &egui::Context, pointer: Pos2, node: &Node, full_path: &str, view_size: u64) {
+    let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::unique("hover_card")));
+    let width = 300.0;
+    let pad = vec2(16.0, 14.0);
+    let inner_w = width - pad.x * 2.0;
+    let path = theme::galley(&painter, full_path, mono(12.0), 0.0, inner_w);
+    let name = theme::galley(&painter, node.name.to_string(), display(16.0), 0.0, inner_w);
+    let detail = if node.is_dir {
+        format!(
+            "{} {} · double-click to zoom in · right-click for actions",
+            group(node.files),
+            plural(node.files, "file", "files")
+        )
+    } else {
+        "Right-click for actions".to_string()
+    };
+    let detail = theme::galley(&painter, detail, body(11.0), 0.0, inner_w);
+    let height = pad.y * 2.0 + 14.0 + 6.0 + name.size().y + 6.0 + path.size().y + 8.0 + 1.0 + 8.0 + 28.0 + 6.0 + detail.size().y;
+
+    let screen = ctx.content_rect();
+    let mut pos = pointer + vec2(18.0, 18.0);
+    if pos.x + width > screen.right() - 8.0 {
+        pos.x = pointer.x - width - 18.0;
+    }
+    if pos.y + height > screen.bottom() - 8.0 {
+        pos.y = pointer.y - height - 18.0;
+    }
+    let card = Rect::from_min_size(pos, vec2(width, height));
+    painter.add(theme::glow_shape(card, CYAN, 0.18, 26.0));
+    painter.add(theme::chamfer_shape(card, 14.0, BG, Stroke::new(1.0, CYAN)));
+
+    let (tag, tag_color) = if node.is_dir {
+        let color = if node.kind == Kind::App { theme::kind_style(Kind::App).edge } else { CYAN };
+        (theme::kind_tag(node.kind), color)
+    } else {
+        (theme::kind_tag(node.kind), theme::kind_style(node.kind).edge)
+    };
+    let mut y = card.top() + pad.y;
+    let x = card.left() + pad.x;
+    theme::text(&painter, pos2(x, y), Align2::LEFT_TOP, format!("■ {tag}"), mono(11.0), tag_color, 1.5);
+    theme::text(&painter, pos2(card.right() - pad.x, y), Align2::RIGHT_TOP, "TARGET LOCK", mono(11.0), MUTED, 1.5);
+    y += 14.0 + 6.0;
+    let name_h = name.size().y;
+    painter.galley(pos2(x, y), name, TEXT);
+    y += name_h + 6.0;
+    let path_h = path.size().y;
+    painter.galley(pos2(x, y), path, MUTED);
+    y += path_h + 8.0;
+    painter.extend(Shape::dashed_line(&[pos2(x, y), pos2(card.right() - pad.x, y)], Stroke::new(1.0, BORDER), 4.0, 3.0));
+    y += 1.0 + 8.0;
+    theme::glow_text(&painter, pos2(x, y + 14.0), Align2::LEFT_CENTER, format_size(node.size), mono_medium(22.0), CYAN, 0.0);
+    let pct = 100.0 * node.size as f64 / view_size.max(1) as f64;
+    theme::text(&painter, pos2(card.right() - pad.x, y + 16.0), Align2::RIGHT_CENTER, format!("{pct:.1}%"), mono(12.0), MUTED, 0.0);
+    y += 28.0 + 6.0;
+    painter.galley(pos2(x, y), detail, MUTED);
 }
 
-fn kind_color(kind: Kind) -> Color32 {
-    match kind {
-        Kind::Folder => Color32::from_rgb(92, 104, 128),
-        Kind::App => Color32::from_rgb(178, 132, 222),
-        Kind::Video => Color32::from_rgb(232, 104, 104),
-        Kind::Audio => Color32::from_rgb(240, 160, 72),
-        Kind::Image => Color32::from_rgb(110, 196, 124),
-        Kind::Archive => Color32::from_rgb(222, 198, 84),
-        Kind::Document => Color32::from_rgb(96, 164, 232),
-        Kind::Code => Color32::from_rgb(84, 200, 196),
-        Kind::System => Color32::from_rgb(166, 168, 180),
-        Kind::Other => Color32::from_rgb(196, 166, 136),
+#[derive(Clone, Copy, PartialEq)]
+enum CardStyle {
+    Suggested,
+    Normal,
+    Dashed,
+}
+
+/// A large start-screen target button.
+#[allow(clippy::too_many_arguments)]
+fn target_card(
+    ui: &mut Ui,
+    width: f32,
+    ic: Icon,
+    icon_color: Color32,
+    title: &str,
+    subtitle: &str,
+    tag: Option<&str>,
+    style: CardStyle,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 132.0), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, true, title));
+    let painter = ui.painter();
+    let hovered = response.hovered();
+    match style {
+        CardStyle::Suggested => {
+            theme::glow(painter, rect, MAGENTA, if hovered { 0.4 } else { 0.25 }, 24.0);
+            painter.add(theme::chamfer_shape(rect, 16.0, MAGENTA_DEEP, Stroke::new(1.0, MAGENTA)));
+        }
+        CardStyle::Normal => {
+            painter.rect(rect, 0.0, if hovered { RAISED } else { SURFACE }, Stroke::new(1.0, if hovered { CYAN } else { BORDER }), StrokeKind::Inside);
+        }
+        CardStyle::Dashed => {
+            if hovered {
+                painter.rect_filled(rect, 0.0, RAISED);
+            }
+            theme::dashed_rect(painter, rect, Stroke::new(1.0, if hovered { CYAN } else { DIM }));
+        }
+    }
+    let clip = painter.with_clip_rect(rect.shrink(4.0));
+    let x = rect.left() + 18.0;
+    theme::icon(&clip, Rect::from_min_size(pos2(x, rect.top() + 18.0), vec2(22.0, 22.0)), ic, icon_color);
+    if let Some(tag) = tag {
+        theme::text(&clip, pos2(rect.right() - 18.0, rect.top() + 22.0), Align2::RIGHT_TOP, tag, mono(11.0), MAGENTA_SOFT, 1.5);
+    }
+    theme::text(&clip, pos2(x, rect.top() + 58.0), Align2::LEFT_TOP, title, display(18.0), TEXT, 0.7);
+    theme::text(&clip, pos2(x, rect.top() + 88.0), Align2::LEFT_TOP, subtitle, mono(12.0), MUTED, 0.0);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// One breadcrumb: the current folder is boxed in glowing cyan.
+fn crumb(ui: &mut Ui, name: &str, current: bool) -> egui::Response {
+    let painter = ui.painter().clone();
+    let g = theme::galley(&painter, name, mono(13.0), 0.0, f32::INFINITY);
+    let pad = if current { vec2(8.0, 4.0) } else { vec2(0.0, 4.0) };
+    let (rect, response) = ui.allocate_exact_size(g.size() + pad * 2.0, if current { Sense::hover() } else { Sense::click() });
+    response.widget_info(|| WidgetInfo::labeled(if current { Role::Label } else { Role::Link }, true, name));
+    if current {
+        theme::glow(&painter, rect, CYAN, 0.3, 12.0);
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, CYAN), StrokeKind::Inside);
+        painter.galley(rect.min + pad, g, CYAN);
+    } else {
+        let color = if response.hovered() { CYAN } else { MUTED };
+        painter.galley(rect.min + pad, g, color);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    response
+}
+
+/// The header's segmented "folders done" bar.
+fn node_bar(painter: &Painter, rect: Rect, done: u64, total: u64) {
+    let segments = total.clamp(1, 24) as usize;
+    let filled = if total == 0 { 0 } else { (done as f64 / total as f64 * segments as f64).floor() as usize };
+    let gap = 3.0;
+    let w = (rect.width() - gap * (segments - 1) as f32) / segments as f32;
+    for i in 0..segments {
+        let r = Rect::from_min_size(pos2(rect.left() + i as f32 * (w + gap), rect.top()), vec2(w, rect.height()));
+        if i < filled {
+            theme::glow(painter, r, CYAN, 0.4, 8.0);
+            painter.rect_filled(r, 0.0, CYAN);
+        } else if i == filled && done < total {
+            painter.rect(r, 0.0, CYAN_DEEP, Stroke::new(1.0, CYAN), StrokeKind::Inside);
+        } else {
+            painter.rect_filled(r, 0.0, TRACK);
+        }
     }
 }
 
-/// Folder frames get lighter with depth so nesting is easy to follow.
-fn folder_color(kind: Kind, depth: usize) -> Color32 {
-    let step = (depth.min(8) as f32) * 9.0;
-    let (r, g, b) = if kind == Kind::App { (92.0, 64.0, 120.0) } else { (52.0, 60.0, 78.0) };
-    Color32::from_rgb((r + step) as u8, (g + step) as u8, (b + step * 1.1) as u8)
+/// The status bar's magenta disk usage meter.
+fn usage_bar(painter: &Painter, rect: Rect, used: f32) {
+    painter.rect_filled(rect, 0.0, TRACK);
+    let fill = Rect::from_min_size(rect.min, vec2(rect.width() * used.clamp(0.0, 1.0), rect.height()));
+    theme::glow(painter, fill, MAGENTA, 0.45, 10.0);
+    painter.rect_filled(fill, 0.0, MAGENTA);
+}
+
+/// The start screen's capacity ring, drawn on a 340-unit design grid.
+fn capacity_ring(painter: &Painter, rect: Rect, used: f32) {
+    let s = rect.width() / 340.0;
+    let c = rect.center();
+    let tau = std::f32::consts::TAU;
+    painter.circle_stroke(c, 156.0 * s, Stroke::new(1.0, BORDER));
+    painter.circle_stroke(c, 124.0 * s, Stroke::new(20.0 * s, TRACK));
+    let arc = theme::arc(c, 124.0 * s, 0.0, tau * used.clamp(0.0, 1.0));
+    painter.add(Shape::line(arc.clone(), Stroke::new(30.0 * s, theme::glow_color(MAGENTA, 0.18))));
+    painter.add(Shape::line(arc, Stroke::new(20.0 * s, MAGENTA)));
+    // Notches cut the ring into segments, like the design.
+    let notches = 80;
+    for i in 0..notches {
+        let a = tau * i as f32 / notches as f32 - std::f32::consts::FRAC_PI_2;
+        let dir = egui::Vec2::angled(a);
+        painter.line_segment([c + dir * 112.0 * s, c + dir * 136.0 * s], Stroke::new(2.5 * s, BG));
+    }
+    let inner = theme::arc(c, 94.0 * s, 0.0, tau);
+    painter.extend(Shape::dashed_line(&inner, Stroke::new(1.0, theme::glow_color(CYAN, 0.7)), 2.0 * s, 8.0 * s));
+    for a in [0.0f32, 90.0, 180.0, 270.0] {
+        let dir = egui::Vec2::angled(a.to_radians());
+        painter.line_segment([c + dir * 146.0 * s, c + dir * 164.0 * s], Stroke::new(1.5, CYAN));
+    }
+    theme::text(painter, c + vec2(0.0, -8.0 * s), Align2::CENTER_CENTER, format!("{:.0}%", used * 100.0), mono_medium(50.0 * s), TEXT, 0.0);
+    theme::text(painter, c + vec2(0.0, 30.0 * s), Align2::CENTER_CENTER, "CAPACITY USED", mono(12.0 * s.max(0.85)), MAGENTA, 3.0);
 }
 
 /// One clickable row in the side list.
@@ -839,49 +1709,45 @@ fn item_row(
     actions: &mut Vec<Action>,
 ) {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-    let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_H - 2.0), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{}, {}", node.name, format_size(node.size))));
+    let painter = ui.painter_at(rect.expand(12.0));
     let is_selected = selected.is_some_and(|s| s.as_slice() == path);
     if is_selected {
-        painter.rect_filled(rect, CornerRadius::same(3), visuals.selection.bg_fill);
+        theme::glow(&painter, rect, MAGENTA, 0.2, 14.0);
+        painter.rect(rect, 0.0, MAGENTA_DEEP, Stroke::new(1.0, MAGENTA), StrokeKind::Inside);
     } else if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(3), visuals.widgets.hovered.weak_bg_fill);
+        painter.rect_filled(rect, 0.0, RAISED);
     }
-    // Share-of-parent bar along the bottom edge.
-    let share = node.size as f32 / parent_size.max(1) as f32;
-    let bar = Rect::from_min_size(Pos2::new(rect.min.x + 22.0, rect.max.y - 3.0), vec2((width - 26.0) * share, 2.0));
-    painter.rect_filled(bar, 0.0, kind_color(node.kind).gamma_multiply(0.8));
+    let st = theme::kind_style(node.kind);
+    let swatch_color = if is_selected {
+        MAGENTA
+    } else if node.is_dir && node.kind != Kind::App {
+        GREY
+    } else {
+        st.edge
+    };
+    let top = rect.top() + 8.0;
+    painter.rect_filled(Rect::from_min_size(pos2(rect.left() + 10.0, top + 5.0), vec2(8.0, 8.0)), 0.0, swatch_color);
 
-    let swatch = Rect::from_center_size(Pos2::new(rect.min.x + 10.0, rect.center().y - 1.0), vec2(12.0, 12.0));
-    let swatch_color = if node.is_dir { folder_color(node.kind, 2) } else { kind_color(node.kind) };
-    painter.rect_filled(swatch, 2.0, swatch_color);
-
-    let text_color = visuals.text_color();
     let size_text = format_size(node.size);
-    let size_w = 70.0;
-    painter.text(
-        Pos2::new(rect.max.x - 4.0, rect.center().y - 1.0),
-        Align2::RIGHT_CENTER,
-        &size_text,
-        FontId::proportional(12.0),
-        text_color,
-    );
-    let name_rect = Rect::from_min_max(Pos2::new(rect.min.x + 22.0, rect.min.y), Pos2::new(rect.max.x - size_w, rect.max.y));
-    let name = if node.is_dir { format!("{}/", node.name) } else { node.name.to_string() };
-    let galley = painter.layout_no_wrap(name, FontId::proportional(12.5), text_color);
-    let name_w = galley.size().x;
-    painter.with_clip_rect(name_rect).galley(Pos2::new(name_rect.min.x, rect.center().y - galley.size().y / 2.0 - 1.0), galley, text_color);
-    if !detail.is_empty() && name_w + 12.0 < name_rect.width() {
-        let detail_rect = Rect::from_min_max(Pos2::new(name_rect.min.x + name_w + 8.0, rect.min.y), name_rect.max);
-        painter.with_clip_rect(detail_rect).text(
-            Pos2::new(detail_rect.min.x, rect.center().y - 1.0),
-            Align2::LEFT_CENTER,
-            detail,
-            FontId::proportional(11.0),
-            visuals.weak_text_color(),
-        );
+    let size_color = if is_selected { MAGENTA_SOFT } else { TEXT };
+    let size_rect = theme::text(&painter, pos2(rect.right() - 10.0, top + 9.0), Align2::RIGHT_CENTER, size_text.clone(), mono(13.0), size_color, 0.0);
+    let name_clip = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top()), pos2(size_rect.left() - 8.0, rect.bottom()));
+    let name_font = if is_selected { body_semibold(14.0) } else { body_medium(14.0) };
+    let name = theme::galley(&painter, node.name.to_string(), name_font, 0.0, f32::INFINITY);
+    let name_w = name.size().x;
+    painter.with_clip_rect(name_clip).galley(pos2(name_clip.left(), top + 9.0 - name.size().y / 2.0), name, TEXT);
+    if !detail.is_empty() && name_w + 12.0 < name_clip.width() {
+        let d = Rect::from_min_max(pos2(name_clip.left() + name_w + 8.0, rect.top()), name_clip.max);
+        theme::text(&painter.with_clip_rect(d), pos2(d.left(), top + 9.0), Align2::LEFT_CENTER, detail, mono(11.0), MUTED, 0.0);
     }
+
+    let share = node.size as f32 / parent_size.max(1) as f32;
+    let bar = Rect::from_min_size(pos2(rect.left() + 10.0, rect.bottom() - 9.0), vec2(width - 20.0, 3.0));
+    painter.rect_filled(bar, 0.0, TRACK);
+    let fill = Rect::from_min_size(bar.min, vec2(bar.width() * share, 3.0));
+    painter.rect_filled(fill, 0.0, if is_selected { MAGENTA } else { GREY });
 
     if response.clicked() {
         actions.push(Action::Select(path.to_vec()));
@@ -889,34 +1755,40 @@ fn item_row(
     if response.double_clicked() {
         actions.push(Action::ZoomTo(path.to_vec()));
     }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     let response = response.on_hover_text(format!("{} · {:.1}% of this folder", size_text, share * 100.0));
     response.context_menu(|ui| context_menu_items(ui, tree, path, scanning, actions));
 }
 
 fn context_menu_items(ui: &mut Ui, tree: &Node, path: &[usize], scanning: bool, actions: &mut Vec<Action>) {
     let Some(node) = tree.at(path) else { return };
-    ui.label(RichText::new(&*node.name).strong());
-    ui.label(RichText::new(format_size(node.size)).weak());
+    ui.set_min_width(200.0);
+    ui.label(RichText::new(&*node.name).font(display(14.0)).color(TEXT));
+    ui.label(RichText::new(format_size(node.size)).font(mono(12.0)).color(CYAN));
     ui.separator();
-    if node.is_dir && ui.button("Zoom In").clicked() {
+    let item = |ui: &mut Ui, label: &str| ui.button(RichText::new(label).font(body_medium(13.0)));
+    if node.is_dir && item(ui, "Zoom In").clicked() {
         actions.push(Action::ZoomTo(path.to_vec()));
         ui.close();
     }
-    if ui.button("Reveal in Finder").clicked() {
+    if item(ui, "Reveal in Finder").clicked() {
         actions.push(Action::Reveal(path.to_vec()));
         ui.close();
     }
-    if ui.button("Open").clicked() {
+    if item(ui, "Open").clicked() {
         actions.push(Action::Open(path.to_vec()));
         ui.close();
     }
-    if ui.button("Copy Path").clicked() {
+    if item(ui, "Copy Path").clicked() {
         actions.push(Action::CopyPath(path.to_vec()));
         ui.close();
     }
     ui.separator();
     let can_trash = !scanning && !path.is_empty();
-    let trash = ui.add_enabled(can_trash, egui::Button::new("Move to Trash…"));
+    let label = RichText::new("Move to Trash…").font(body_medium(13.0)).color(MAGENTA);
+    let trash = ui.add_enabled(can_trash, egui::Button::new(label));
     let trash = if scanning { trash.on_disabled_hover_text("Wait for the scan to finish") } else { trash };
     if trash.clicked() {
         actions.push(Action::AskTrash(path.to_vec()));
@@ -924,8 +1796,50 @@ fn context_menu_items(ui: &mut Ui, tree: &Node, path: &[usize], scanning: bool, 
     }
 }
 
-/// Free and total bytes of the volume holding `path`.
-fn volume_space(path: &Path) -> Option<(u64, u64)> {
+// ------------------------------------------------------------- helpers --
+
+fn plural(n: u64, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 { one } else { many }
+}
+
+/// 1204388 → "1,204,388".
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Path for display, with the home folder shown as `~`.
+fn tilde(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return if rest.as_os_str().is_empty() { "~".into() } else { format!("~/{}", rest.display()) };
+    }
+    path.display().to_string()
+}
+
+struct VolumeInfo {
+    free: u64,
+    total: u64,
+    mount: PathBuf,
+    fs_type: String,
+}
+
+impl VolumeInfo {
+    fn used_fraction(&self) -> f32 {
+        if self.total == 0 { 0.0 } else { 1.0 - self.free as f32 / self.total as f32 }
+    }
+}
+
+/// Space, mount point and file system of the volume holding `path`.
+fn volume_info(path: &Path) -> Option<VolumeInfo> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
@@ -933,6 +1847,66 @@ fn volume_space(path: &Path) -> Option<(u64, u64)> {
     if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
+    // SAFETY: statfs fills these as NUL-terminated C strings.
+    let mount = unsafe { std::ffi::CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_string_lossy().into_owned();
+    let fs_type = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_string_lossy().into_owned();
     let block = stat.f_bsize as u64;
-    Some((stat.f_bavail * block, stat.f_blocks * block))
+    Some(VolumeInfo { free: stat.f_bavail * block, total: stat.f_blocks * block, mount: PathBuf::from(mount), fs_type })
+}
+
+/// The startup disk's name as Finder shows it, from the /Volumes entry
+/// that points back at `/`.
+fn startup_volume_name() -> String {
+    std::fs::read_dir("/Volumes")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == Path::new("/")))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Macintosh HD".to_string())
+}
+
+fn volume_display_name(mount: &Path, startup_name: &str) -> String {
+    if mount == Path::new("/") || mount == Path::new("/System/Volumes/Data") {
+        startup_name.to_string()
+    } else {
+        mount.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| mount.display().to_string())
+    }
+}
+
+fn root_crumbs(root: &Path, startup_name: &str) -> RootCrumbs {
+    let mount = volume_info(root).map(|v| v.mount).unwrap_or_else(|| PathBuf::from("/"));
+    let volume = volume_display_name(&mount, startup_name);
+    // Firmlinked paths like /Users live on the data volume but aren't under
+    // its mount point, so fall back to the path from `/`.
+    let rel = root.strip_prefix(&mount).or_else(|_| root.strip_prefix("/")).unwrap_or(root);
+    let mut parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    match parts.pop() {
+        Some(label) => {
+            let mut above = vec![volume];
+            above.extend(parts);
+            RootCrumbs { above, label }
+        }
+        None => RootCrumbs { above: Vec::new(), label: volume },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_000), "1,000");
+        assert_eq!(group(1_204_388), "1,204,388");
+    }
+
+    #[test]
+    fn pluralises() {
+        assert_eq!(plural(1, "item", "items"), "item");
+        assert_eq!(plural(0, "item", "items"), "items");
+        assert_eq!(plural(3, "item", "items"), "items");
+    }
 }

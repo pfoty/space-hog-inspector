@@ -33,19 +33,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const LEGEND: [Kind; 10] = [
-        Kind::Folder,
-        Kind::App,
-        Kind::Video,
-        Kind::Audio,
-        Kind::Image,
-        Kind::Archive,
-        Kind::Document,
-        Kind::Code,
-        Kind::System,
-        Kind::Other,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Kind::Folder => "Folder",
@@ -233,6 +220,9 @@ pub struct Progress {
     pub dirs: AtomicU64,
     pub bytes: AtomicU64,
     pub errors: AtomicU64,
+    /// Folders directly inside the scan root, and how many are finished.
+    pub top_total: AtomicU64,
+    pub top_done: AtomicU64,
     pub cancel: AtomicBool,
     pub current: Mutex<PathBuf>,
     pub error_paths: Mutex<Vec<(PathBuf, String)>>,
@@ -247,11 +237,61 @@ impl Progress {
             list.push((path.to_path_buf(), err.to_string()));
         }
     }
+
+    fn record_skip(&self, path: &Path) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut list) = self.error_paths.lock()
+            && list.len() < MAX_ERRORS_KEPT
+        {
+            list.push((path.to_path_buf(), SKIPPED_REASON.to_string()));
+        }
+    }
+}
+
+pub const SKIPPED_REASON: &str = "Skipped to avoid a macOS permission prompt";
+
+/// Folders macOS guards with a per-folder permission prompt ("would like to
+/// access files in your Documents folder", "...data from other apps", ...).
+/// Reading them without Full Disk Access pops up a dialog for each one.
+pub struct ProtectedPaths {
+    /// These folders themselves are protected.
+    exact: Vec<PathBuf>,
+    /// Every folder directly inside these is protected (one prompt per app
+    /// container, cloud provider or mounted volume).
+    children_of: Vec<PathBuf>,
+}
+
+impl ProtectedPaths {
+    pub fn for_home(home: &Path) -> ProtectedPaths {
+        let exact = ["Desktop", "Documents", "Downloads", "Library/Mobile Documents"]
+            .iter()
+            .map(|p| home.join(p))
+            .collect();
+        let mut children_of: Vec<PathBuf> = ["Library/Containers", "Library/Group Containers", "Library/CloudStorage"]
+            .iter()
+            .map(|p| home.join(p))
+            .collect();
+        children_of.push(PathBuf::from("/Volumes"));
+        ProtectedPaths { exact, children_of }
+    }
+
+    pub fn is_protected(&self, path: &Path) -> bool {
+        // The data volume is also reachable under /System/Volumes/Data when
+        // scanning from `/`, so compare by the usual path.
+        let path = match path.strip_prefix("/System/Volumes/Data") {
+            Ok(rest) => Path::new("/").join(rest),
+            Err(_) => path.to_path_buf(),
+        };
+        self.exact.contains(&path) || path.parent().is_some_and(|p| self.children_of.iter().any(|c| c == p))
+    }
 }
 
 pub struct ScanOptions {
     /// Descend into other mounted volumes (external drives, network shares).
     pub cross_volumes: bool,
+    /// Folders to leave out so macOS doesn't prompt for each one. `None`
+    /// scans everything (and macOS may prompt).
+    pub skip: Option<ProtectedPaths>,
 }
 
 /// Messages sent from the scan to the UI as the root's entries complete.
@@ -265,6 +305,7 @@ struct Ctx<'a> {
     progress: &'a Progress,
     allowed_devs: Vec<u64>,
     cross_volumes: bool,
+    skip: Option<ProtectedPaths>,
     seen_inodes: Mutex<HashSet<(u64, u64)>>,
 }
 
@@ -298,6 +339,7 @@ pub fn scan(root: &Path, options: ScanOptions, progress: &Progress, tx: &Sender<
         progress,
         allowed_devs,
         cross_volumes: options.cross_volumes,
+        skip: options.skip,
         seen_inodes: Mutex::new(HashSet::new()),
     };
     if let Ok(md) = fs::symlink_metadata(root) {
@@ -316,10 +358,12 @@ pub fn scan(root: &Path, options: ScanOptions, progress: &Progress, tx: &Sender<
         let _ = tx.send(ScanMsg::Entry(node));
     }
     progress.dirs.fetch_add(1, Ordering::Relaxed);
+    progress.top_total.store(dirs.len() as u64, Ordering::Relaxed);
     dirs.into_par_iter().for_each_with(tx.clone(), |tx, (path, name)| {
         if let Some(node) = scan_dir(&path, name, &ctx) {
             let _ = tx.send(ScanMsg::Entry(node));
         }
+        progress.top_done.fetch_add(1, Ordering::Relaxed);
     });
     let _ = tx.send(ScanMsg::Done);
 }
@@ -344,6 +388,21 @@ pub fn scan_to_tree(root: &Path, options: ScanOptions) -> Node {
 
 type Entries = (Vec<Node>, Vec<(PathBuf, String)>);
 
+/// How many times to retry a call that a signal interrupted (EINTR).
+const INTERRUPT_RETRIES: usize = 5;
+
+/// Runs `op`, retrying when the system call was interrupted. That error is
+/// temporary (seen on files other processes are busy with), not a refusal.
+fn retry_interrupted<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && attempt < INTERRUPT_RETRIES => attempt += 1,
+            result => return result,
+        }
+    }
+}
+
 /// Reads one directory: returns its files as finished nodes and its
 /// subdirectories as paths still to be scanned.
 fn read_entries(path: &Path, ctx: &Ctx) -> Option<Entries> {
@@ -354,7 +413,7 @@ fn read_entries(path: &Path, ctx: &Ctx) -> Option<Entries> {
         current.clear();
         current.push(path);
     }
-    let read = match fs::read_dir(path) {
+    let read = match retry_interrupted(|| fs::read_dir(path)) {
         Ok(r) => r,
         Err(e) => {
             ctx.progress.record_error(path, &e);
@@ -373,7 +432,7 @@ fn read_entries(path: &Path, ctx: &Ctx) -> Option<Entries> {
         };
         let child_path = entry.path();
         // symlink_metadata: never follow symlinks.
-        let md = match fs::symlink_metadata(&child_path) {
+        let md = match retry_interrupted(|| fs::symlink_metadata(&child_path)) {
             Ok(m) => m,
             Err(e) => {
                 ctx.progress.record_error(&child_path, &e);
@@ -382,6 +441,10 @@ fn read_entries(path: &Path, ctx: &Ctx) -> Option<Entries> {
         };
         let name = entry.file_name().to_string_lossy().into_owned();
         if md.is_dir() {
+            if ctx.skip.as_ref().is_some_and(|s| s.is_protected(&child_path)) {
+                ctx.progress.record_skip(&child_path);
+                continue;
+            }
             if ctx.device_allowed(md.dev()) && ctx.first_visit(&md) {
                 dirs.push((child_path, name));
             }
@@ -455,7 +518,7 @@ mod tests {
         write_file(&dir.join("small/c.txt"), 10);
         write_file(&dir.join("top.bin"), 50_000);
 
-        let tree = scan_to_tree(&dir, ScanOptions { cross_volumes: false });
+        let tree = scan_to_tree(&dir, ScanOptions { cross_volumes: false, skip: None });
         assert_eq!(tree.files, 4);
         assert_eq!(&*tree.children[0].name, "big");
         assert!(tree.children[0].size >= 500_000);
@@ -475,7 +538,7 @@ mod tests {
         write_file(&dir.join("sub/x.bin"), 300_000);
         std::os::unix::fs::symlink(dir.join("sub"), dir.join("sublink")).unwrap();
 
-        let tree = scan_to_tree(&dir, ScanOptions { cross_volumes: false });
+        let tree = scan_to_tree(&dir, ScanOptions { cross_volumes: false, skip: None });
         let data_files = tree.children.iter().filter(|c| c.name.ends_with(".dat")).count();
         assert_eq!(data_files, 1, "hard link counted twice");
         let sub = tree.children.iter().find(|c| &*c.name == "sub").unwrap();
@@ -483,6 +546,81 @@ mod tests {
         assert!(!link.is_dir);
         assert!(link.size < sub.size);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn protected_paths_match_prompting_folders() {
+        let p = ProtectedPaths::for_home(Path::new("/Users/me"));
+        assert!(p.is_protected(Path::new("/Users/me/Documents")));
+        assert!(p.is_protected(Path::new("/Users/me/Library/Mobile Documents")));
+        assert!(p.is_protected(Path::new("/Users/me/Library/Containers/com.apple.mail")));
+        assert!(p.is_protected(Path::new("/Users/me/Library/Group Containers/group.x")));
+        assert!(p.is_protected(Path::new("/Volumes/USB Stick")));
+        // Reached through the data volume when scanning the whole disk.
+        assert!(p.is_protected(Path::new("/System/Volumes/Data/Users/me/Desktop")));
+
+        assert!(!p.is_protected(Path::new("/Users/me")));
+        assert!(!p.is_protected(Path::new("/Users/me/Library/Containers")));
+        assert!(!p.is_protected(Path::new("/Users/me/Documents/Projects")));
+        assert!(!p.is_protected(Path::new("/Users/me/Movies")));
+        assert!(!p.is_protected(Path::new("/Volumes")));
+    }
+
+    #[test]
+    fn skipped_folders_are_left_out_and_reported() {
+        let dir = temp_dir("skip");
+        fs::create_dir_all(dir.join("Documents")).unwrap();
+        fs::create_dir_all(dir.join("Movies")).unwrap();
+        write_file(&dir.join("Documents/secret.pdf"), 100_000);
+        write_file(&dir.join("Movies/clip.mov"), 100_000);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress = Progress::default();
+        let options = ScanOptions { cross_volumes: false, skip: Some(ProtectedPaths::for_home(&dir)) };
+        scan(&dir, options, &progress, &tx);
+        drop(tx);
+        let names: Vec<String> = rx
+            .into_iter()
+            .filter_map(|m| match m {
+                ScanMsg::Entry(n) => Some(n.name.to_string()),
+                ScanMsg::Done => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Movies"]);
+        let errors = progress.error_paths.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, dir.join("Documents"));
+        assert_eq!(errors[0].1, SKIPPED_REASON);
+        drop(errors);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_calls_are_retried() {
+        use std::io::{Error, ErrorKind};
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 { Err(Error::from(ErrorKind::Interrupted)) } else { Ok(42) }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 3);
+
+        // Gives up after the retry limit, and never retries other errors.
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(Error::from(ErrorKind::Interrupted))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, INTERRUPT_RETRIES + 1);
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(Error::from(ErrorKind::PermissionDenied))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
