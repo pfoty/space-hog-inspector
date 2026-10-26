@@ -1,11 +1,11 @@
 //! The Space Hog Inspector window: header, treemap, side panel, status bar,
 //! start screen and dialogs, drawn in the Neo-Noir Cyberpunk style.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,7 @@ use eframe::egui::{
     RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 
+use crate::ai::{self, Agent, Assessment, Facts, Provider, Verdict};
 use crate::scanner::{self, Kind, Node, ProtectedPaths, Progress, ScanMsg, ScanOptions, format_size};
 use crate::settings::{self, Settings};
 use crate::theme::{
@@ -35,6 +36,7 @@ const LOG_LINES: usize = 5;
 enum SideTab {
     Contents,
     LargestFiles,
+    Ai,
 }
 
 /// UI events gathered while drawing and applied afterwards, so drawing
@@ -47,6 +49,10 @@ enum Action {
     Open(Vec<usize>),
     CopyPath(Vec<usize>),
     AskTrash(Vec<usize>),
+    /// Ask the AI agent about an item; `true` skips the cached answer.
+    AskAi(Vec<usize>, bool),
+    CancelAi,
+    OpenSettings,
 }
 
 struct ActiveScan {
@@ -65,6 +71,28 @@ struct TrashRequest {
     is_dir: bool,
     kind: Kind,
     files: u64,
+}
+
+/// The item an AI question is about. Names, not indices, so it survives
+/// the tree being re-sorted.
+#[derive(Clone)]
+struct AiSubject {
+    names: Vec<Box<str>>,
+    fs_path: PathBuf,
+    facts: Facts,
+    provider: Provider,
+}
+
+struct AiJob {
+    subject: AiSubject,
+    rx: Receiver<Result<Assessment, String>>,
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+struct AiAnswer {
+    subject: AiSubject,
+    result: Result<Assessment, String>,
 }
 
 struct LargestCache {
@@ -112,6 +140,13 @@ pub struct SpaceHogApp {
     error_count: u64,
     error_paths: Vec<(PathBuf, String)>,
     show_errors: bool,
+    /// Installed AI agents (found at start and on "Detect again").
+    ai_agents: Vec<Agent>,
+    ai_job: Option<AiJob>,
+    ai_answer: Option<AiAnswer>,
+    /// Answers by (path, size) for this session, so asking again is instant
+    /// until the item changes.
+    ai_cache: HashMap<(PathBuf, u64), (Provider, Assessment)>,
 }
 
 impl SpaceHogApp {
@@ -148,6 +183,10 @@ impl SpaceHogApp {
             error_count: 0,
             error_paths: Vec::new(),
             show_errors: false,
+            ai_agents: ai::detect(),
+            ai_job: None,
+            ai_answer: None,
+            ai_cache: HashMap::new(),
         };
         if let Some(path) = initial {
             app.start_scan(path, &cc.egui_ctx);
@@ -311,7 +350,82 @@ impl SpaceHogApp {
                     });
                 }
             }
+            Action::AskAi(path, fresh) => self.ask_ai(&path, fresh, ctx),
+            Action::CancelAi => {
+                if let Some(job) = self.ai_job.take() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Action::OpenSettings => self.open_settings(),
         }
+    }
+
+    fn ai_agent(&self) -> Option<&Agent> {
+        let provider = self.settings.ai_provider?;
+        self.ai_agents.iter().find(|a| a.provider == provider)
+    }
+
+    /// Starts asking the chosen agent about the item at `path`, or shows the
+    /// cached answer.
+    fn ask_ai(&mut self, path: &[usize], fresh: bool, ctx: &egui::Context) {
+        let Some(provider) = self.settings.ai_provider else {
+            self.message = Some(("Choose an AI agent in Settings first.".into(), true));
+            return;
+        };
+        let Some(agent) = self.ai_agent().cloned() else {
+            self.message = Some((format!("{} isn't installed on this Mac.", provider.label()), true));
+            return;
+        };
+        let (Some(tree), Some(fs_path)) = (self.tree.as_ref(), self.fs_path(path)) else { return };
+        let Some(node) = tree.at(path) else { return };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let subject =
+            AiSubject { names: tree.names_along(path), facts: Facts::gather(node, &fs_path, home.as_deref()), fs_path, provider };
+        self.side_tab = SideTab::Ai;
+        let key = (subject.fs_path.clone(), subject.facts.size);
+        if !fresh && let Some((cached_by, answer)) = self.ai_cache.get(&key).cloned() {
+            self.ai_answer = Some(AiAnswer { subject: AiSubject { provider: cached_by, ..subject }, result: Ok(answer) });
+            return;
+        }
+        if let Some(job) = self.ai_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let facts = subject.facts.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ai::ask(&agent, &facts, &thread_cancel));
+            repaint.request_repaint();
+        });
+        self.ai_answer = None;
+        self.ai_job = Some(AiJob { subject, rx, cancel, started: Instant::now() });
+    }
+
+    /// Picks up the agent's answer when it arrives.
+    fn poll_ai(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.ai_job else { return };
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Disconnected) => Err(format!("{} stopped unexpectedly.", job.subject.provider.label())),
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+                return;
+            }
+        };
+        let job = self.ai_job.take().unwrap();
+        if let Ok(answer) = &result {
+            let key = (job.subject.fs_path.clone(), job.subject.facts.size);
+            self.ai_cache.insert(key, (job.subject.provider, answer.clone()));
+        }
+        self.ai_answer = Some(AiAnswer { subject: job.subject, result });
+    }
+
+    /// Where the AI answer's item is in the current tree, if it's still there.
+    fn ai_subject_path(&self, subject: &AiSubject) -> Option<Vec<usize>> {
+        let path = self.tree.as_ref()?.path_of_names(&subject.names);
+        (path.len() == subject.names.len() && self.fs_path(&path).as_ref() == Some(&subject.fs_path)).then_some(path)
     }
 
     fn run_open(&mut self, cmd: &mut Command) {
@@ -337,6 +451,10 @@ impl SpaceHogApp {
         }
         self.selected = None;
         self.generation += 1;
+        self.ai_cache.remove(&(request.fs_path.clone(), request.size));
+        if self.ai_answer.as_ref().is_some_and(|a| a.subject.fs_path.starts_with(&request.fs_path)) {
+            self.ai_answer = None;
+        }
         self.message = Some((
             format!(
                 "Moved {} to the Trash. Its {} is freed when you empty the Trash.",
@@ -528,15 +646,18 @@ impl SpaceHogApp {
             }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let w = ui.available_width() / 2.0;
-                if theme::tab(ui, "CONTENTS", self.side_tab == SideTab::Contents, w).clicked() {
-                    self.side_tab = SideTab::Contents;
-                }
-                if theme::tab(ui, "LARGEST FILES", self.side_tab == SideTab::LargestFiles, w).clicked() {
-                    self.side_tab = SideTab::LargestFiles;
+                let w = ui.available_width() / 3.0;
+                for (label, tab) in [("CONTENTS", SideTab::Contents), ("LARGEST", SideTab::LargestFiles), ("AI", SideTab::Ai)] {
+                    if theme::tab(ui, label, self.side_tab == tab, w).clicked() {
+                        self.side_tab = tab;
+                    }
                 }
             });
             ui.add_space(4.0);
+            if self.side_tab == SideTab::Ai {
+                self.ai_panel(ui, actions);
+                return;
+            }
             theme::caption(ui, "FILTER BY NAME", MUTED);
             theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(12, 9), |ui| {
                 ui.horizontal(|ui| {
@@ -558,6 +679,7 @@ impl SpaceHogApp {
             let filter = self.filter.to_lowercase();
             let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
             let scanning = self.scan.is_some();
+            let ai_ready = self.ai_agent().is_some();
 
             match self.side_tab {
                 SideTab::Contents => {
@@ -573,7 +695,7 @@ impl SpaceHogApp {
                             let mut path = self.view.clone();
                             path.push(i);
                             let detail = if child.is_dir { format!("{} files", group(child.files)) } else { String::new() };
-                            item_row(ui, tree, &path, child, view_node.size, &detail, self.selected.as_ref(), scanning, actions);
+                            item_row(ui, tree, &path, child, view_node.size, &detail, self.selected.as_ref(), scanning, ai_ready, actions);
                         }
                     });
                 }
@@ -604,12 +726,129 @@ impl SpaceHogApp {
                         for (path, _, _, parent) in &rows[range] {
                             if let Some(node) = tree.at(path) {
                                 let detail = if parent.is_empty() { "./".to_string() } else { format!("{parent}/") };
-                                item_row(ui, tree, path, node, view_node.size, &detail, self.selected.as_ref(), scanning, actions);
+                                item_row(ui, tree, path, node, view_node.size, &detail, self.selected.as_ref(), scanning, ai_ready, actions);
                             }
                         }
                     });
                 }
+                // Drawn above, before the filter box.
+                SideTab::Ai => {}
             }
+        });
+    }
+
+    /// The AI tab: what gets sent, the question in progress, and the answer.
+    fn ai_panel(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let wrapped = |ui: &mut Ui, text: &str, font: egui::FontId, color: Color32| {
+            ui.add(egui::Label::new(RichText::new(text).font(font).color(color)).wrap());
+        };
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
+            let Some(provider) = self.settings.ai_provider else {
+                theme::caption(ui, "// AI ASSISTANT", MUTED);
+                wrapped(
+                    ui,
+                    "Ask the AI agent you already use, Claude Code or Codex, whether an item is safe to remove. \
+                     Choose one in Settings to turn this on.",
+                    body(14.0),
+                    TEXT,
+                );
+                if Button::new("Open Settings", Tone::Outline(CYAN)).small().show(ui).clicked() {
+                    actions.push(Action::OpenSettings);
+                }
+                return;
+            };
+            let name = provider.label();
+            if self.ai_agent().is_none() {
+                theme::framed(ui, YELLOW_DEEP, Stroke::new(1.0, YELLOW), 0.0, None, 14, |ui| {
+                    ui.set_width(ui.available_width());
+                    wrapped(ui, &format!("{name} isn't installed on this Mac. Install it, or choose another agent in Settings."), body(13.0), YELLOW);
+                });
+            }
+
+            if let Some(job) = &self.ai_job {
+                theme::framed(ui, BG, Stroke::new(1.0, CYAN), 0.0, Some(CYAN), 16, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    theme::caption(ui, &format!("// ASKING {}", name.to_uppercase()), CYAN);
+                    ai_subject_header(ui, &job.subject);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(CYAN));
+                        let t = job.started.elapsed().as_secs_f32();
+                        ui.label(RichText::new(format!("T+{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).font(mono(12.0)).color(MUTED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if Button::new("Cancel", Tone::Ghost).small().show(ui).clicked() {
+                                actions.push(Action::CancelAi);
+                            }
+                        });
+                    });
+                });
+            } else if let Some(answer) = &self.ai_answer {
+                let item_path = self.ai_subject_path(&answer.subject);
+                ai_subject_header(ui, &answer.subject);
+                match &answer.result {
+                    Err(e) => {
+                        theme::framed(ui, YELLOW_DEEP, Stroke::new(1.0, YELLOW), 0.0, None, 14, |ui| {
+                            ui.set_width(ui.available_width());
+                            wrapped(ui, e, body(13.0), YELLOW);
+                        });
+                    }
+                    Ok(a) => {
+                        verdict_badge(ui, a.verdict);
+                        theme::caption(ui, "WHAT IT IS", MUTED);
+                        wrapped(ui, &a.what_it_is, body(14.0), TEXT);
+                        if !a.risks.is_empty() {
+                            theme::caption(ui, "RISKS", MUTED);
+                            for risk in &a.risks {
+                                wrapped(ui, &format!("•  {risk}"), body(13.0), TEXT);
+                            }
+                        }
+                        theme::caption(ui, "COMES BACK ON ITS OWN", MUTED);
+                        let again = if a.regenerates { "Yes. macOS or an app recreates it when needed." } else { "No. Once removed, it stays gone." };
+                        wrapped(ui, again, body(13.0), TEXT);
+                        if !a.safer_way.trim().is_empty() {
+                            theme::caption(ui, "SAFER WAY", MUTED);
+                            wrapped(ui, &a.safer_way, body(13.0), TEXT);
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let can_trash = item_path.as_ref().is_some_and(|p| !p.is_empty()) && !self.scanning();
+                    if Button::new("Move to Trash…", Tone::Outline(MAGENTA)).small().enabled(can_trash).show(ui).clicked()
+                        && let Some(p) = &item_path
+                    {
+                        actions.push(Action::AskTrash(p.clone()));
+                    }
+                    let can_ask = item_path.is_some() && self.ai_agent().is_some() && !self.scanning();
+                    if Button::new("Ask again", Tone::Ghost).small().enabled(can_ask).show(ui).clicked()
+                        && let Some(p) = item_path
+                    {
+                        actions.push(Action::AskAi(p, true));
+                    }
+                });
+                wrapped(
+                    ui,
+                    &format!("Answered by {}. AI advice can be wrong, so check before you remove anything.", answer.subject.provider.label()),
+                    body(12.0),
+                    MUTED,
+                );
+                let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(rule, 0.0, BORDER);
+            }
+
+            theme::caption(ui, "// HOW IT WORKS", MUTED);
+            wrapped(
+                ui,
+                &format!(
+                    "Right-click any item and choose Ask AI… to get an answer here. {name} gets its path (with your home folder shown as ~), \
+                     size, type, age, and the names and sizes of the {} largest items inside. It never gets file \
+                     contents. It answers using your own {name} sign-in.",
+                    ai::TOP_ITEMS
+                ),
+                body(13.0),
+                MUTED,
+            );
         });
     }
 
@@ -953,10 +1192,11 @@ impl SpaceHogApp {
         }
 
         let scanning = self.scanning();
+        let ai_ready = self.ai_agent().is_some();
         let target: Option<Vec<usize>> = ui.ctx().data(|d| d.get_temp(target_id));
         response.context_menu(|ui| {
             if let Some(target) = &target {
-                context_menu_items(ui, tree, target, scanning, actions);
+                context_menu_items(ui, tree, target, scanning, ai_ready, actions);
             }
         });
     }
@@ -966,6 +1206,7 @@ impl eframe::App for SpaceHogApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_scan(&ctx);
+        self.poll_ai(&ctx);
         while let Ok(event) = self.menu_events.try_recv() {
             if event.id.as_ref() == MENU_SETTINGS {
                 self.open_settings();
@@ -1116,6 +1357,14 @@ impl SpaceHogApp {
                                 theme::glow_text(ui.painter(), r.min, Align2::LEFT_TOP, format_size(request.size), mono_medium(24.0), CYAN, 0.0);
                             });
                         });
+                        if let Some((provider, answer)) = self.ai_cache.get(&(request.fs_path.clone(), request.size)) {
+                            let color = verdict_color(answer.verdict);
+                            ui.horizontal(|ui| {
+                                let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                theme::status_light(ui.painter(), light.center(), color);
+                                theme::caption(ui, &format!("{} SAYS: {}", provider.label().to_uppercase(), answer.verdict.label()), color);
+                            });
+                        }
                     });
                     ui.label(
                         RichText::new("Nothing is deleted for good. You can put it back from the Trash in Finder. The space is freed when you empty the Trash.")
@@ -1240,115 +1489,180 @@ impl SpaceHogApp {
                     });
                     let (rule, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
                     ui.painter().rect_filled(rule, 0.0, BORDER);
+                    // Scrolls when the window is too short for every section.
+                    let max_h = (ctx.content_rect().height() - 260.0).max(200.0);
+                    egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 18.0;
+                        let (edge, status) = if self.full_disk_access { (GREEN, "GRANTED") } else { (YELLOW, "NOT GRANTED") };
+                        theme::framed(ui, BG, Stroke::new(1.0, edge), 18.0, None, 20, |ui| {
+                            ui.set_width(width - 40.0);
+                            ui.spacing_mut().item_spacing.y = 14.0;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("FULL DISK ACCESS").font(display(17.0)).color(TEXT).extra_letter_spacing(0.7));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if Button::new("Check again", Tone::Ghost).small().show(ui).clicked() {
+                                        self.full_disk_access = settings::has_full_disk_access();
+                                    }
+                                    // A fixed slot inside the right-to-left row keeps the
+                                    // badge's reading order and its natural width.
+                                    ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
+                                        ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
+                                            theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 6), |ui| {
+                                                ui.horizontal(|ui| {
+                                                    let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                                    theme::status_light(ui.painter(), light.center(), edge);
+                                                    theme::caption(ui, status, edge);
+                                                });
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                            let about = if self.full_disk_access {
+                                "Space Hog Inspector can read every folder, and macOS won't ask for permission folder by folder."
+                            } else {
+                                "Without it, macOS asks separately before the app can read Desktop, Documents, Downloads, \
+                                 iCloud Drive, other apps' data and external drives, and hides Mail, Messages and Safari \
+                                 data completely. Turning it on once covers all of them."
+                            };
+                            ui.label(RichText::new(about).font(body(14.0)).color(MUTED));
+                            if !self.full_disk_access {
+                                let card_w = (width - 40.0 - 20.0) / 3.0;
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    let steps = [
+                                        ("[01]", "Open the Full Disk Access list", "Open System Settings", true),
+                                        ("[02]", "Switch on Space Hog Inspector, or drag it into the list", "Show app in Finder", false),
+                                        ("[03]", "Relaunch so macOS applies the change", "Relaunch", false),
+                                    ];
+                                    for (i, (num, text, action, primary)) in steps.into_iter().enumerate() {
+                                        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
+                                            ui.set_width(card_w - 28.0);
+                                            ui.spacing_mut().item_spacing.y = 10.0;
+                                            ui.label(RichText::new(num).font(mono(12.0)).color(CYAN));
+                                            ui.allocate_ui(vec2(card_w - 28.0, 36.0), |ui| {
+                                                ui.set_min_height(36.0);
+                                                ui.label(RichText::new(text).font(body(13.0)).color(TEXT));
+                                            });
+                                            let tone = if primary { Tone::Primary(CYAN) } else { Tone::Outline(CYAN) };
+                                            if Button::new(action, tone).size(12.0).width(card_w - 28.0).show(ui).clicked() {
+                                                match i {
+                                                    0 => {
+                                                        if let Err(e) = settings::open_full_disk_access_settings() {
+                                                            self.message = Some((format!("Couldn't open System Settings: {e}"), true));
+                                                        }
+                                                    }
+                                                    1 => {
+                                                        if let Err(e) = settings::reveal_app_in_finder() {
+                                                            self.message = Some((format!("Couldn't open Finder: {e}"), true));
+                                                        }
+                                                    }
+                                                    _ => relaunch = true,
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
 
-                    let (edge, status) = if self.full_disk_access { (GREEN, "GRANTED") } else { (YELLOW, "NOT GRANTED") };
-                    theme::framed(ui, BG, Stroke::new(1.0, edge), 18.0, None, 20, |ui| {
-                        ui.set_width(width - 40.0);
-                        ui.spacing_mut().item_spacing.y = 14.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("FULL DISK ACCESS").font(display(17.0)).color(TEXT).extra_letter_spacing(0.7));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if Button::new("Check again", Tone::Ghost).small().show(ui).clicked() {
-                                    self.full_disk_access = settings::has_full_disk_access();
-                                }
-                                // A fixed slot inside the right-to-left row keeps the
-                                // badge's reading order and its natural width.
-                                ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
-                                    ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
-                                        theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 6), |ui| {
+                        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(20, 14), |ui| {
+                            ui.set_width(width - 40.0);
+                            ui.spacing_mut().item_spacing.y = 12.0;
+                            theme::caption(ui, "// SCANNING", MUTED);
+                            let skip_note = if self.full_disk_access {
+                                "Full Disk Access is on, so nothing needs to be skipped. A folder you pick yourself is never skipped."
+                            } else {
+                                "Only while Full Disk Access is off. Skipped folders are listed in the status bar. A folder you pick yourself is never skipped."
+                            };
+                            setting_switch(ui, "Skip folders that would make macOS ask for permission", skip_note, &mut self.settings.skip_protected);
+                            setting_switch(
+                                ui,
+                                "Include other mounted volumes",
+                                "Follow into external drives and network shares found inside the scanned folder.",
+                                &mut self.settings.cross_volumes,
+                            );
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui(vec2(width - 40.0 - 260.0, 48.0), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 4.0;
+                                        ui.label(RichText::new("Default treemap depth").font(body_medium(15.0)).color(TEXT));
+                                        ui.label(RichText::new("How many nested levels the treemap draws.").font(body(13.0)).color(MUTED));
+                                    });
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.allocate_ui_with_layout(vec2(220.0, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                                        theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(14, 8), |ui| {
                                             ui.horizontal(|ui| {
-                                                let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                                theme::status_light(ui.painter(), light.center(), edge);
-                                                theme::caption(ui, status, edge);
+                                                ui.spacing_mut().item_spacing.x = 12.0;
+                                                ui.add(egui::Slider::new(&mut self.settings.max_depth, 1..=12).show_value(false));
+                                                ui.label(RichText::new(format!("{:02}", self.settings.max_depth)).font(mono(13.0)).color(CYAN));
                                             });
                                         });
                                     });
                                 });
                             });
                         });
-                        let about = if self.full_disk_access {
-                            "Space Hog Inspector can read every folder, and macOS won't ask for permission folder by folder."
-                        } else {
-                            "Without it, macOS asks separately before the app can read Desktop, Documents, Downloads, \
-                             iCloud Drive, other apps' data and external drives, and hides Mail, Messages and Safari \
-                             data completely. Turning it on once covers all of them."
-                        };
-                        ui.label(RichText::new(about).font(body(14.0)).color(MUTED));
-                        if !self.full_disk_access {
-                            let card_w = (width - 40.0 - 20.0) / 3.0;
-                            ui.horizontal_top(|ui| {
+
+                        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(20, 14), |ui| {
+                            ui.set_width(width - 40.0);
+                            ui.spacing_mut().item_spacing.y = 12.0;
+                            ui.horizontal(|ui| {
+                                theme::caption(ui, "// AI ASSISTANT", MUTED);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if Button::new("Detect again", Tone::Ghost).small().show(ui).clicked() {
+                                        self.ai_agents = ai::detect();
+                                    }
+                                });
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Ask the AI agent you already use whether an item is safe to remove. It answers with \
+                                     your own sign-in and plan, and gets each item's path, size, type, age and largest \
+                                     contents, never file contents.",
+                                )
+                                .font(body(13.0))
+                                .color(MUTED),
+                            );
+                            ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                let steps = [
-                                    ("[01]", "Open the Full Disk Access list", "Open System Settings", true),
-                                    ("[02]", "Switch on Space Hog Inspector, or drag it into the list", "Show app in Finder", false),
-                                    ("[03]", "Relaunch so macOS applies the change", "Relaunch", false),
-                                ];
-                                for (i, (num, text, action, primary)) in steps.into_iter().enumerate() {
-                                    theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
-                                        ui.set_width(card_w - 28.0);
-                                        ui.spacing_mut().item_spacing.y = 10.0;
-                                        ui.label(RichText::new(num).font(mono(12.0)).color(CYAN));
-                                        ui.allocate_ui(vec2(card_w - 28.0, 36.0), |ui| {
-                                            ui.set_min_height(36.0);
-                                            ui.label(RichText::new(text).font(body(13.0)).color(TEXT));
+                                let choices = [(None, "Off")].into_iter().chain(Provider::ALL.map(|p| (Some(p), p.label())));
+                                for (choice, label) in choices {
+                                    let installed = choice.is_none_or(|p| self.ai_agents.iter().any(|a| a.provider == p));
+                                    let tone = if self.settings.ai_provider == choice { Tone::Primary(CYAN) } else { Tone::Ghost };
+                                    if Button::new(label, tone).small().width(150.0).enabled(installed).show(ui).clicked() {
+                                        self.settings.ai_provider = choice;
+                                    }
+                                }
+                            });
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                for provider in Provider::ALL {
+                                    let found = self.ai_agents.iter().find(|a| a.provider == provider);
+                                    let (status, color) = match found {
+                                        Some(a) => (tilde(&a.exe), TEXT),
+                                        None => ("not installed".to_string(), DIM),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.allocate_ui_with_layout(vec2(110.0, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                                            ui.set_width(110.0);
+                                            ui.label(RichText::new(provider.label()).font(body_medium(13.0)).color(TEXT));
                                         });
-                                        let tone = if primary { Tone::Primary(CYAN) } else { Tone::Outline(CYAN) };
-                                        if Button::new(action, tone).size(12.0).width(card_w - 28.0).show(ui).clicked() {
-                                            match i {
-                                                0 => {
-                                                    if let Err(e) = settings::open_full_disk_access_settings() {
-                                                        self.message = Some((format!("Couldn't open System Settings: {e}"), true));
-                                                    }
-                                                }
-                                                1 => {
-                                                    if let Err(e) = settings::reveal_app_in_finder() {
-                                                        self.message = Some((format!("Couldn't open Finder: {e}"), true));
-                                                    }
-                                                }
-                                                _ => relaunch = true,
-                                            }
-                                        }
+                                        ui.label(RichText::new(status).font(mono(12.0)).color(color));
                                     });
                                 }
                             });
-                        }
-                    });
-
-                    theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(20, 14), |ui| {
-                        ui.set_width(width - 40.0);
-                        ui.spacing_mut().item_spacing.y = 12.0;
-                        theme::caption(ui, "// SCANNING", MUTED);
-                        let skip_note = if self.full_disk_access {
-                            "Full Disk Access is on, so nothing needs to be skipped. A folder you pick yourself is never skipped."
-                        } else {
-                            "Only while Full Disk Access is off. Skipped folders are listed in the status bar. A folder you pick yourself is never skipped."
-                        };
-                        setting_switch(ui, "Skip folders that would make macOS ask for permission", skip_note, &mut self.settings.skip_protected);
-                        setting_switch(
-                            ui,
-                            "Include other mounted volumes",
-                            "Follow into external drives and network shares found inside the scanned folder.",
-                            &mut self.settings.cross_volumes,
-                        );
-                        ui.horizontal(|ui| {
-                            ui.allocate_ui(vec2(width - 40.0 - 260.0, 48.0), |ui| {
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    ui.label(RichText::new("Default treemap depth").font(body_medium(15.0)).color(TEXT));
-                                    ui.label(RichText::new("How many nested levels the treemap draws.").font(body(13.0)).color(MUTED));
-                                });
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.allocate_ui_with_layout(vec2(220.0, 40.0), Layout::left_to_right(Align::Center), |ui| {
-                                    theme::framed(ui, BG, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(14, 8), |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 12.0;
-                                            ui.add(egui::Slider::new(&mut self.settings.max_depth, 1..=12).show_value(false));
-                                            ui.label(RichText::new(format!("{:02}", self.settings.max_depth)).font(mono(13.0)).color(CYAN));
-                                        });
-                                    });
-                                });
-                            });
+                            if self.settings.ai_provider == Some(Provider::Codex) {
+                                ui.label(
+                                    RichText::new(
+                                        "Codex can't have its tools switched off. It runs in its read-only sandbox, but it \
+                                         can still look at files on your disk while answering, using this app's Full Disk \
+                                         Access.",
+                                    )
+                                    .font(body(13.0))
+                                    .color(YELLOW),
+                                );
+                            }
                         });
                     });
 
@@ -1621,6 +1935,47 @@ fn target_card(
 }
 
 /// One breadcrumb: the current folder is boxed in glowing cyan.
+fn verdict_color(verdict: Verdict) -> Color32 {
+    match verdict {
+        Verdict::Safe => GREEN,
+        Verdict::LikelySafe => CYAN,
+        Verdict::Caution => YELLOW,
+        Verdict::Keep => MAGENTA,
+    }
+}
+
+/// The verdict as a neon status badge.
+fn verdict_badge(ui: &mut Ui, verdict: Verdict) {
+    let color = verdict_color(verdict);
+    theme::framed(ui, BG, Stroke::new(1.0, color), 0.0, Some(color), Margin::symmetric(12, 8), |ui| {
+        ui.horizontal(|ui| {
+            let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+            theme::status_light(ui.painter(), light.center(), color);
+            ui.label(RichText::new(verdict.label()).font(display(15.0)).color(color).extra_letter_spacing(1.2));
+        });
+    });
+}
+
+/// The asked-about item's name, size and path.
+fn ai_subject_header(ui: &mut Ui, subject: &AiSubject) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            let name = subject.names.last().map(|n| n.to_string()).unwrap_or_else(|| subject.facts.path.clone());
+            let size = format_size(subject.facts.size);
+            let size_w = theme::galley(ui.painter(), size.clone(), mono(13.0), 0.0, f32::INFINITY).size().x;
+            // A fixed slot for the name, so truncating it leaves room for the size.
+            let name_w = (ui.available_width() - size_w - 12.0).max(40.0);
+            ui.allocate_ui_with_layout(vec2(name_w, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(name_w);
+                ui.add(egui::Label::new(RichText::new(name).font(display(16.0)).color(TEXT)).truncate());
+            });
+            ui.label(RichText::new(size).font(mono(13.0)).color(CYAN));
+        });
+        ui.add(egui::Label::new(RichText::new(&subject.facts.path).font(mono(11.0)).color(MUTED)).wrap());
+    });
+}
+
 fn crumb(ui: &mut Ui, name: &str, current: bool) -> egui::Response {
     let painter = ui.painter().clone();
     let g = theme::galley(&painter, name, mono(13.0), 0.0, f32::INFINITY);
@@ -1706,6 +2061,7 @@ fn item_row(
     detail: &str,
     selected: Option<&Vec<usize>>,
     scanning: bool,
+    ai_ready: bool,
     actions: &mut Vec<Action>,
 ) {
     let width = ui.available_width();
@@ -1759,10 +2115,10 @@ fn item_row(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let response = response.on_hover_text(format!("{} · {:.1}% of this folder", size_text, share * 100.0));
-    response.context_menu(|ui| context_menu_items(ui, tree, path, scanning, actions));
+    response.context_menu(|ui| context_menu_items(ui, tree, path, scanning, ai_ready, actions));
 }
 
-fn context_menu_items(ui: &mut Ui, tree: &Node, path: &[usize], scanning: bool, actions: &mut Vec<Action>) {
+fn context_menu_items(ui: &mut Ui, tree: &Node, path: &[usize], scanning: bool, ai_ready: bool, actions: &mut Vec<Action>) {
     let Some(node) = tree.at(path) else { return };
     ui.set_min_width(200.0);
     ui.label(RichText::new(&*node.name).font(display(14.0)).color(TEXT));
@@ -1783,6 +2139,16 @@ fn context_menu_items(ui: &mut Ui, tree: &Node, path: &[usize], scanning: bool, 
     }
     if item(ui, "Copy Path").clicked() {
         actions.push(Action::CopyPath(path.to_vec()));
+        ui.close();
+    }
+    let ask = ui.add_enabled(ai_ready && !scanning, egui::Button::new(RichText::new("Ask AI…").font(body_medium(13.0)).color(CYAN)));
+    let ask = if scanning {
+        ask.on_disabled_hover_text("Wait for the scan to finish")
+    } else {
+        ask.on_disabled_hover_text("Choose an AI agent in Settings")
+    };
+    if ask.clicked() {
+        actions.push(Action::AskAi(path.to_vec(), false));
         ui.close();
     }
     ui.separator();

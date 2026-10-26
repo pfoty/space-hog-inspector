@@ -6,6 +6,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ai::Provider;
+
 pub const FULL_DISK_ACCESS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
@@ -19,11 +21,14 @@ pub struct Settings {
     /// Without Full Disk Access, leave out folders that would make macOS
     /// ask for permission one folder at a time.
     pub skip_protected: bool,
+    /// Installed AI agent asked whether items are safe to remove; `None`
+    /// keeps AI off, so nothing is sent anywhere.
+    pub ai_provider: Option<Provider>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_depth: 6, cross_volumes: false, skip_protected: true }
+        Settings { max_depth: 6, cross_volumes: false, skip_protected: true, ai_provider: None }
     }
 }
 
@@ -105,11 +110,12 @@ mod tests {
         assert_eq!(s.max_depth, 9);
         assert!(s.skip_protected);
         assert!(!s.cross_volumes);
+        assert_eq!(s.ai_provider, None);
     }
 
     #[test]
     fn round_trips_through_json() {
-        let s = Settings { max_depth: 3, cross_volumes: true, skip_protected: false };
+        let s = Settings { max_depth: 3, cross_volumes: true, skip_protected: false, ai_provider: Some(Provider::Codex) };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(s, back);
     }

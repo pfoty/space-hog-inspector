@@ -1,5 +1,6 @@
 //! Space Hog Inspector: see where your disk space goes.
 
+mod ai;
 mod app;
 mod scanner;
 mod settings;
@@ -21,7 +22,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Space Hog Inspector")
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([760.0, 480.0]),
+            .with_min_inner_size([760.0, 480.0])
+            // An empty icon stops eframe replacing the bundle's AppIcon.icns
+            // with its own default icon at launch.
+            .with_icon(egui::IconData::default()),
         ..Default::default()
     };
     eframe::run_native(
