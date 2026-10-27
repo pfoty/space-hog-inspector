@@ -7,13 +7,14 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use rayon::prelude::*;
+
+use crate::platform;
 
 /// Maximum number of unreadable paths remembered for display.
 const MAX_ERRORS_KEPT: usize = 500;
@@ -70,8 +71,10 @@ impl Kind {
             | "tsx" | "jsx" | "java" | "kt" | "go" | "rb" | "php" | "html" | "css" | "json"
             | "xml" | "yaml" | "yml" | "toml" | "sql" | "sqlite" | "db" | "rlib" | "o" | "a"
             | "class" | "jar" | "wasm" | "pyc" => Kind::Code,
+            "exe" => Kind::App,
+            "msi" | "msix" | "appx" | "cab" => Kind::Archive,
             "dylib" | "so" | "framework" | "kext" | "plist" | "log" | "cache" | "dat" | "bin"
-            | "vmdk" | "vdi" | "qcow2" | "car" | "nib" | "strings" => Kind::System,
+            | "vmdk" | "vdi" | "qcow2" | "car" | "nib" | "strings" | "dll" | "sys" | "vhdx" => Kind::System,
             _ => Kind::Other,
         }
     }
@@ -310,13 +313,15 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Returns true the first time a (device, inode) pair is seen.
-    fn first_visit(&self, md: &fs::Metadata) -> bool {
-        self.seen_inodes.lock().map(|mut s| s.insert((md.dev(), md.ino()))).unwrap_or(true)
+    /// Returns true the first time a file is seen (by its id, so a hard
+    /// link counts once), and when its id is unknown.
+    fn first_visit(&self, id: Option<(u64, u64)>) -> bool {
+        let Some(id) = id else { return true };
+        self.seen_inodes.lock().map(|mut s| s.insert(id)).unwrap_or(true)
     }
 
-    fn device_allowed(&self, dev: u64) -> bool {
-        self.cross_volumes || self.allowed_devs.contains(&dev)
+    fn device_allowed(&self, dev: Option<u64>) -> bool {
+        self.cross_volumes || dev.is_some_and(|d| self.allowed_devs.contains(&d))
     }
 }
 
@@ -324,17 +329,12 @@ impl Ctx<'_> {
 /// complete so the UI can draw the tree while the scan is still running.
 pub fn scan(root: &Path, options: ScanOptions, progress: &Progress, tx: &Sender<ScanMsg>) {
     let mut allowed_devs = Vec::new();
-    if let Ok(md) = fs::metadata(root) {
-        allowed_devs.push(md.dev());
-    }
-    // On macOS the boot disk is a read-only system volume plus a data volume
-    // joined by firmlinks (/Users, /Applications, ...). Treat both as the
-    // same disk when scanning from the top.
-    if root == Path::new("/")
-        && let Ok(md) = fs::metadata("/System/Volumes/Data")
+    if let Ok(md) = fs::metadata(root)
+        && let Some(dev) = platform::file_facts(root, &md).volume
     {
-        allowed_devs.push(md.dev());
+        allowed_devs.push(dev);
     }
+    allowed_devs.extend(platform::same_disk_volumes(root));
     let ctx = Ctx {
         progress,
         allowed_devs,
@@ -343,7 +343,7 @@ pub fn scan(root: &Path, options: ScanOptions, progress: &Progress, tx: &Sender<
         seen_inodes: Mutex::new(HashSet::new()),
     };
     if let Ok(md) = fs::symlink_metadata(root) {
-        ctx.first_visit(&md);
+        ctx.first_visit(platform::file_facts(root, &md).id);
     }
 
     let entries = match read_entries(root, &ctx) {
@@ -440,20 +440,21 @@ fn read_entries(path: &Path, ctx: &Ctx) -> Option<Entries> {
             }
         };
         let name = entry.file_name().to_string_lossy().into_owned();
+        let facts = platform::file_facts(&child_path, &md);
         if md.is_dir() {
             if ctx.skip.as_ref().is_some_and(|s| s.is_protected(&child_path)) {
                 ctx.progress.record_skip(&child_path);
                 continue;
             }
-            if ctx.device_allowed(md.dev()) && ctx.first_visit(&md) {
+            if ctx.device_allowed(facts.volume) && ctx.first_visit(facts.id) {
                 dirs.push((child_path, name));
             }
             continue;
         }
-        if md.nlink() > 1 && !md.is_symlink() && !ctx.first_visit(&md) {
+        if facts.links > 1 && !md.is_symlink() && !ctx.first_visit(facts.id) {
             continue;
         }
-        let size = md.blocks() * 512;
+        let size = facts.size;
         ctx.progress.files.fetch_add(1, Ordering::Relaxed);
         ctx.progress.bytes.fetch_add(size, Ordering::Relaxed);
         files.push(Node::file(name, size));
@@ -530,24 +531,56 @@ mod tests {
     }
 
     #[test]
-    fn hard_links_count_once_and_symlinks_are_not_followed() {
-        let dir = temp_dir("links");
+    fn hard_links_count_once() {
+        let dir = temp_dir("hardlinks");
         write_file(&dir.join("orig.dat"), 200_000);
         fs::hard_link(dir.join("orig.dat"), dir.join("link.dat")).unwrap();
-        fs::create_dir_all(dir.join("sub")).unwrap();
-        write_file(&dir.join("sub/x.bin"), 300_000);
-        std::os::unix::fs::symlink(dir.join("sub"), dir.join("sublink")).unwrap();
 
         let tree = scan_to_tree(&dir, ScanOptions { cross_volumes: false, skip: None });
         let data_files = tree.children.iter().filter(|c| c.name.ends_with(".dat")).count();
         assert_eq!(data_files, 1, "hard link counted twice");
-        let sub = tree.children.iter().find(|c| &*c.name == "sub").unwrap();
-        let link = tree.children.iter().find(|c| &*c.name == "sublink").unwrap();
-        assert!(!link.is_dir);
-        assert!(link.size < sub.size);
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Checks that `name`, a link to the folder `sub`, isn't followed.
+    fn assert_link_not_followed(dir: &Path, name: &str) {
+        let tree = scan_to_tree(dir, ScanOptions { cross_volumes: false, skip: None });
+        let sub = tree.children.iter().find(|c| &*c.name == "sub").unwrap();
+        let link = tree.children.iter().find(|c| &*c.name == name).unwrap();
+        assert!(!link.is_dir);
+        assert!(link.size < sub.size);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed() {
+        let dir = temp_dir("symlinks");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        write_file(&dir.join("sub/x.bin"), 300_000);
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("sublink")).unwrap();
+        assert_link_not_followed(&dir, "sublink");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_not_followed() {
+        let dir = temp_dir("junctions");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        write_file(&dir.join("sub/x.bin"), 300_000);
+        // Junctions need no special rights to create, unlike symlinks.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("junction"))
+            .arg(dir.join("sub"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_link_not_followed(&dir, "junction");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn protected_paths_match_prompting_folders() {
         let p = ProtectedPaths::for_home(Path::new("/Users/me"));
@@ -689,6 +722,9 @@ mod tests {
     fn classifies_kinds() {
         assert_eq!(Kind::for_file("Movie.MOV"), Kind::Video);
         assert_eq!(Kind::for_file(".zshrc"), Kind::Other);
+        assert_eq!(Kind::for_file("setup.exe"), Kind::App);
+        assert_eq!(Kind::for_file("kernel32.DLL"), Kind::System);
+        assert_eq!(Kind::for_file("installer.msi"), Kind::Archive);
         assert_eq!(Kind::for_dir("Safari.app"), Kind::App);
     }
 }

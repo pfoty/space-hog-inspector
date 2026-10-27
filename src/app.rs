@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -16,7 +15,8 @@ use eframe::egui::{
 
 use crate::ai::{self, Agent, Assessment, Facts, Provider, Verdict};
 use crate::scanner::{self, Kind, Node, ProtectedPaths, Progress, ScanMsg, ScanOptions, format_size};
-use crate::settings::{self, Settings};
+use crate::platform::{self, VolumeInfo};
+use crate::settings::Settings;
 use crate::theme::{
     self, BG, BORDER, Button, CYAN, CYAN_DEEP, DIM, GREEN, GREY, Icon, MAGENTA, MAGENTA_DEEP, MAGENTA_SOFT,
     MUTED, PANEL, RAISED, SURFACE, TEXT, TRACK, Tone, YELLOW, YELLOW_DEEP, body, body_medium, body_semibold,
@@ -129,8 +129,9 @@ pub struct SpaceHogApp {
     /// Name of the startup disk, e.g. "Macintosh HD".
     startup_name: String,
     /// Kept alive so the menu bar stays installed.
-    _menu: muda::Menu,
-    menu_events: Receiver<muda::MenuEvent>,
+    _menu: platform::MenuBar,
+    /// Ids of menu bar items the user chose.
+    menu_events: Receiver<String>,
     filter: String,
     side_tab: SideTab,
     largest: Option<LargestCache>,
@@ -153,12 +154,12 @@ impl SpaceHogApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial: Option<PathBuf>,
-        menu: muda::Menu,
-        menu_events: Receiver<muda::MenuEvent>,
+        menu: platform::MenuBar,
+        menu_events: Receiver<String>,
     ) -> Self {
         theme::install(&cc.egui_ctx);
         let settings = Settings::load();
-        let startup_name = startup_volume_name();
+        let startup_name = platform::startup_volume_name();
         let mut app = SpaceHogApp {
             root_path: None,
             root_crumbs: RootCrumbs { above: Vec::new(), label: String::new() },
@@ -170,7 +171,7 @@ impl SpaceHogApp {
             saved_settings: settings.clone(),
             settings,
             show_settings: false,
-            full_disk_access: settings::has_full_disk_access(),
+            full_disk_access: platform::has_full_disk_access(),
             startup_name,
             _menu: menu,
             menu_events,
@@ -199,9 +200,9 @@ impl SpaceHogApp {
         let path = path.canonicalize().unwrap_or(path);
         let progress = Arc::new(Progress::default());
         let (tx, rx) = mpsc::channel();
-        self.full_disk_access = settings::has_full_disk_access();
+        self.full_disk_access = platform::has_full_disk_access();
         let skip = (self.settings.skip_protected && !self.full_disk_access)
-            .then(|| std::env::var_os("HOME").map(|h| ProtectedPaths::for_home(Path::new(&h))))
+            .then(|| platform::home_dir().map(|h| ProtectedPaths::for_home(&h)))
             .flatten();
         let options = ScanOptions { cross_volumes: self.settings.cross_volumes, skip };
         let thread_progress = progress.clone();
@@ -319,13 +320,17 @@ impl SpaceHogApp {
                 }
             }
             Action::Reveal(path) => {
-                if let Some(p) = self.fs_path(&path) {
-                    self.run_open(Command::new("open").arg("-R").arg(p));
+                if let Some(p) = self.fs_path(&path)
+                    && let Err(e) = platform::reveal(&p)
+                {
+                    self.message = Some((format!("Couldn't run open: {e}"), true));
                 }
             }
             Action::Open(path) => {
-                if let Some(p) = self.fs_path(&path) {
-                    self.run_open(Command::new("open").arg(p));
+                if let Some(p) = self.fs_path(&path)
+                    && let Err(e) = platform::open(&p)
+                {
+                    self.message = Some((format!("Couldn't run open: {e}"), true));
                 }
             }
             Action::CopyPath(path) => {
@@ -378,7 +383,7 @@ impl SpaceHogApp {
         };
         let (Some(tree), Some(fs_path)) = (self.tree.as_ref(), self.fs_path(path)) else { return };
         let Some(node) = tree.at(path) else { return };
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = platform::home_dir();
         let subject =
             AiSubject { names: tree.names_along(path), facts: Facts::gather(node, &fs_path, home.as_deref()), fs_path, provider };
         self.side_tab = SideTab::Ai;
@@ -428,19 +433,8 @@ impl SpaceHogApp {
         (path.len() == subject.names.len() && self.fs_path(&path).as_ref() == Some(&subject.fs_path)).then_some(path)
     }
 
-    fn run_open(&mut self, cmd: &mut Command) {
-        if let Err(e) = cmd.status() {
-            self.message = Some((format!("Couldn't run open: {e}"), true));
-        }
-    }
-
     fn move_to_trash(&mut self, request: TrashRequest) {
-        // The crate's default asks Finder via AppleScript, which blocks on an
-        // Automation permission prompt; NSFileManager needs no permission.
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        let mut trash_ctx = trash::TrashContext::default();
-        trash_ctx.set_delete_method(DeleteMethod::NsFileManager);
-        if let Err(e) = trash_ctx.delete(&request.fs_path) {
+        if let Err(e) = platform::move_to_trash(&request.fs_path) {
             self.message = Some((format!("Couldn't move {} to the Trash: {e}", request.name), true));
             return;
         }
@@ -499,9 +493,10 @@ impl SpaceHogApp {
                     node_bar(ui.painter(), bar, done, total);
                     ui.label(RichText::new(count).font(mono(13.0)).color(CYAN));
                 } else {
+                    let (open_key, rescan_key) = (platform::shortcut("O"), platform::shortcut("R"));
                     if Button::new("Choose folder", Tone::Primary(MAGENTA))
                         .icon(Icon::Folder)
-                        .shortcut("⌘O")
+                        .shortcut(&open_key)
                         .show(ui)
                         .clicked()
                     {
@@ -509,7 +504,7 @@ impl SpaceHogApp {
                     }
                     let rescan = Button::new("Rescan", Tone::Outline(CYAN))
                         .icon(Icon::Rescan)
-                        .shortcut("⌘R")
+                        .shortcut(&rescan_key)
                         .enabled(self.root_path.is_some())
                         .show(ui);
                     if rescan.clicked()
@@ -528,7 +523,7 @@ impl SpaceHogApp {
                     });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::icon_button(ui, Icon::Gear, 40.0, "Settings (⌘,)").clicked() {
+                    if theme::icon_button(ui, Icon::Gear, 40.0, &format!("Settings ({})", platform::shortcut(","))).clicked() {
                         self.open_settings();
                     }
                 });
@@ -541,7 +536,7 @@ impl SpaceHogApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let up = Button::new("Up", Tone::Ghost).icon(Icon::Up).height(36.0).enabled(!self.view.is_empty());
-            if up.show(ui).on_hover_text("Backspace or ⌘↑").clicked() {
+            if up.show(ui).on_hover_text(format!("Backspace or {}", platform::shortcut("↑"))).clicked() {
                 actions.push(Action::Up);
             }
             ui.label(RichText::new(">").font(mono(13.0)).color(MUTED));
@@ -604,9 +599,9 @@ impl SpaceHogApp {
                 }
                 ui.add_space(10.0);
 
-                let volume_path = self.root_path.clone().unwrap_or_else(|| PathBuf::from("/"));
-                if let Some(vol) = volume_info(&volume_path) {
-                    ui.label(RichText::new(volume_display_name(&vol.mount, &self.startup_name).to_uppercase()).font(mono(12.0)).color(MUTED));
+                let volume_path = self.root_path.clone().unwrap_or_else(platform::system_root);
+                if let Some(vol) = platform::volume_info(&volume_path) {
+                    ui.label(RichText::new(platform::volume_display_name(&vol.mount, &self.startup_name).to_uppercase()).font(mono(12.0)).color(MUTED));
                     let (bar, _) = ui.allocate_exact_size(vec2(180.0, 8.0), Sense::hover());
                     usage_bar(ui.painter(), bar, vol.used_fraction());
                     ui.label(RichText::new(format_size(vol.free)).font(mono(12.0)).color(TEXT));
@@ -804,8 +799,12 @@ impl SpaceHogApp {
                             }
                         }
                         theme::caption(ui, "COMES BACK ON ITS OWN", MUTED);
-                        let again = if a.regenerates { "Yes. macOS or an app recreates it when needed." } else { "No. Once removed, it stays gone." };
-                        wrapped(ui, again, body(13.0), TEXT);
+                        let again = if a.regenerates {
+                            format!("Yes. {} or an app recreates it when needed.", platform::OS_NAME)
+                        } else {
+                            "No. Once removed, it stays gone.".to_string()
+                        };
+                        wrapped(ui, &again, body(13.0), TEXT);
                         if !a.safer_way.trim().is_empty() {
                             theme::caption(ui, "SAFER WAY", MUTED);
                             wrapped(ui, &a.safer_way, body(13.0), TEXT);
@@ -919,7 +918,7 @@ impl SpaceHogApp {
 
     fn start_screen(&mut self, ui: &mut Ui) {
         let avail = ui.available_rect_before_wrap();
-        let volume = volume_info(Path::new("/"));
+        let volume = platform::volume_info(&platform::system_root());
         if avail.width() >= 960.0 {
             let gap = 20.0;
             let left_w = ((avail.width() - gap) * 0.45).floor();
@@ -1009,7 +1008,7 @@ impl SpaceHogApp {
                 .color(MUTED),
         );
 
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = platform::home_dir();
         let downloads = home.as_ref().map(|h| h.join("Downloads"));
         let card_w = (width - 12.0) / 2.0;
         let mut pick: Option<PathBuf> = None;
@@ -1022,7 +1021,7 @@ impl SpaceHogApp {
                 pick = home.clone();
             }
             if target_card(ui, card_w, Icon::Disk, CYAN, "WHOLE DISK", &self.startup_name, None, CardStyle::Normal).clicked() {
-                pick = Some(PathBuf::from("/"));
+                pick = Some(platform::system_root());
             }
         });
         ui.horizontal(|ui| {
@@ -1031,7 +1030,7 @@ impl SpaceHogApp {
             if target_card(ui, card_w, Icon::Download, CYAN, "DOWNLOADS", &dl_label, None, CardStyle::Normal).clicked() {
                 pick = downloads.clone();
             }
-            if target_card(ui, card_w, Icon::FolderPlus, CYAN, "CHOOSE A FOLDER…", "⌘O", None, CardStyle::Dashed).clicked() {
+            if target_card(ui, card_w, Icon::FolderPlus, CYAN, "CHOOSE A FOLDER…", &platform::shortcut("O"), None, CardStyle::Dashed).clicked() {
                 choose = true;
             }
         });
@@ -1040,6 +1039,9 @@ impl SpaceHogApp {
         }
         if choose {
             self.choose_folder(&ctx);
+        }
+        if !platform::PRIVACY_PROMPTS {
+            return;
         }
 
         if self.full_disk_access {
@@ -1207,8 +1209,8 @@ impl eframe::App for SpaceHogApp {
         let ctx = ui.ctx().clone();
         self.poll_scan(&ctx);
         self.poll_ai(&ctx);
-        while let Ok(event) = self.menu_events.try_recv() {
-            if event.id.as_ref() == MENU_SETTINGS {
+        while let Ok(id) = self.menu_events.try_recv() {
+            if id == MENU_SETTINGS {
                 self.open_settings();
             }
         }
@@ -1304,7 +1306,7 @@ impl eframe::App for SpaceHogApp {
 impl SpaceHogApp {
     fn open_settings(&mut self) {
         self.show_settings = true;
-        self.full_disk_access = settings::has_full_disk_access();
+        self.full_disk_access = platform::has_full_disk_access();
     }
 
     fn save_settings(&mut self) {
@@ -1484,7 +1486,7 @@ impl SpaceHogApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("SETTINGS").font(display_bold(26.0)).color(TEXT).extra_letter_spacing(2.0));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new("⌘,").font(mono(12.0)).color(MUTED));
+                            ui.label(RichText::new(platform::shortcut(",")).font(mono(12.0)).color(MUTED));
                         });
                     });
                     let (rule, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
@@ -1493,89 +1495,93 @@ impl SpaceHogApp {
                     let max_h = (ctx.content_rect().height() - 260.0).max(200.0);
                     egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 18.0;
-                        let (edge, status) = if self.full_disk_access { (GREEN, "GRANTED") } else { (YELLOW, "NOT GRANTED") };
-                        theme::framed(ui, BG, Stroke::new(1.0, edge), 18.0, None, 20, |ui| {
-                            ui.set_width(width - 40.0);
-                            ui.spacing_mut().item_spacing.y = 14.0;
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("FULL DISK ACCESS").font(display(17.0)).color(TEXT).extra_letter_spacing(0.7));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if Button::new("Check again", Tone::Ghost).small().show(ui).clicked() {
-                                        self.full_disk_access = settings::has_full_disk_access();
-                                    }
-                                    // A fixed slot inside the right-to-left row keeps the
-                                    // badge's reading order and its natural width.
-                                    ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
-                                        ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
-                                            theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 6), |ui| {
-                                                ui.horizontal(|ui| {
-                                                    let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                                    theme::status_light(ui.painter(), light.center(), edge);
-                                                    theme::caption(ui, status, edge);
+                        if platform::PRIVACY_PROMPTS {
+                            let (edge, status) = if self.full_disk_access { (GREEN, "GRANTED") } else { (YELLOW, "NOT GRANTED") };
+                            theme::framed(ui, BG, Stroke::new(1.0, edge), 18.0, None, 20, |ui| {
+                                ui.set_width(width - 40.0);
+                                ui.spacing_mut().item_spacing.y = 14.0;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("FULL DISK ACCESS").font(display(17.0)).color(TEXT).extra_letter_spacing(0.7));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if Button::new("Check again", Tone::Ghost).small().show(ui).clicked() {
+                                            self.full_disk_access = platform::has_full_disk_access();
+                                        }
+                                        // A fixed slot inside the right-to-left row keeps the
+                                        // badge's reading order and its natural width.
+                                        ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
+                                            ui.allocate_ui_with_layout(vec2(140.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
+                                                theme::framed(ui, Color32::TRANSPARENT, Stroke::new(1.0, edge), 0.0, None, Margin::symmetric(10, 6), |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let (light, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                                        theme::status_light(ui.painter(), light.center(), edge);
+                                                        theme::caption(ui, status, edge);
+                                                    });
                                                 });
                                             });
                                         });
                                     });
                                 });
-                            });
-                            let about = if self.full_disk_access {
-                                "Space Hog Inspector can read every folder, and macOS won't ask for permission folder by folder."
-                            } else {
-                                "Without it, macOS asks separately before the app can read Desktop, Documents, Downloads, \
-                                 iCloud Drive, other apps' data and external drives, and hides Mail, Messages and Safari \
-                                 data completely. Turning it on once covers all of them."
-                            };
-                            ui.label(RichText::new(about).font(body(14.0)).color(MUTED));
-                            if !self.full_disk_access {
-                                let card_w = (width - 40.0 - 20.0) / 3.0;
-                                ui.horizontal_top(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 10.0;
-                                    let steps = [
-                                        ("[01]", "Open the Full Disk Access list", "Open System Settings", true),
-                                        ("[02]", "Switch on Space Hog Inspector, or drag it into the list", "Show app in Finder", false),
-                                        ("[03]", "Relaunch so macOS applies the change", "Relaunch", false),
-                                    ];
-                                    for (i, (num, text, action, primary)) in steps.into_iter().enumerate() {
-                                        theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
-                                            ui.set_width(card_w - 28.0);
-                                            ui.spacing_mut().item_spacing.y = 10.0;
-                                            ui.label(RichText::new(num).font(mono(12.0)).color(CYAN));
-                                            ui.allocate_ui(vec2(card_w - 28.0, 36.0), |ui| {
-                                                ui.set_min_height(36.0);
-                                                ui.label(RichText::new(text).font(body(13.0)).color(TEXT));
-                                            });
-                                            let tone = if primary { Tone::Primary(CYAN) } else { Tone::Outline(CYAN) };
-                                            if Button::new(action, tone).size(12.0).width(card_w - 28.0).show(ui).clicked() {
-                                                match i {
-                                                    0 => {
-                                                        if let Err(e) = settings::open_full_disk_access_settings() {
-                                                            self.message = Some((format!("Couldn't open System Settings: {e}"), true));
+                                let about = if self.full_disk_access {
+                                    "Space Hog Inspector can read every folder, and macOS won't ask for permission folder by folder."
+                                } else {
+                                    "Without it, macOS asks separately before the app can read Desktop, Documents, Downloads, \
+                                     iCloud Drive, other apps' data and external drives, and hides Mail, Messages and Safari \
+                                     data completely. Turning it on once covers all of them."
+                                };
+                                ui.label(RichText::new(about).font(body(14.0)).color(MUTED));
+                                if !self.full_disk_access {
+                                    let card_w = (width - 40.0 - 20.0) / 3.0;
+                                    ui.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        let steps = [
+                                            ("[01]", "Open the Full Disk Access list", "Open System Settings", true),
+                                            ("[02]", "Switch on Space Hog Inspector, or drag it into the list", "Show app in Finder", false),
+                                            ("[03]", "Relaunch so macOS applies the change", "Relaunch", false),
+                                        ];
+                                        for (i, (num, text, action, primary)) in steps.into_iter().enumerate() {
+                                            theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, 14, |ui| {
+                                                ui.set_width(card_w - 28.0);
+                                                ui.spacing_mut().item_spacing.y = 10.0;
+                                                ui.label(RichText::new(num).font(mono(12.0)).color(CYAN));
+                                                ui.allocate_ui(vec2(card_w - 28.0, 36.0), |ui| {
+                                                    ui.set_min_height(36.0);
+                                                    ui.label(RichText::new(text).font(body(13.0)).color(TEXT));
+                                                });
+                                                let tone = if primary { Tone::Primary(CYAN) } else { Tone::Outline(CYAN) };
+                                                if Button::new(action, tone).size(12.0).width(card_w - 28.0).show(ui).clicked() {
+                                                    match i {
+                                                        0 => {
+                                                            if let Err(e) = platform::open_full_disk_access_settings() {
+                                                                self.message = Some((format!("Couldn't open System Settings: {e}"), true));
+                                                            }
                                                         }
-                                                    }
-                                                    1 => {
-                                                        if let Err(e) = settings::reveal_app_in_finder() {
-                                                            self.message = Some((format!("Couldn't open Finder: {e}"), true));
+                                                        1 => {
+                                                            if let Err(e) = platform::reveal_app_in_finder() {
+                                                                self.message = Some((format!("Couldn't open Finder: {e}"), true));
+                                                            }
                                                         }
+                                                        _ => relaunch = true,
                                                     }
-                                                    _ => relaunch = true,
                                                 }
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        });
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                        }
 
                         theme::framed(ui, SURFACE, Stroke::new(1.0, BORDER), 0.0, None, Margin::symmetric(20, 14), |ui| {
                             ui.set_width(width - 40.0);
                             ui.spacing_mut().item_spacing.y = 12.0;
                             theme::caption(ui, "// SCANNING", MUTED);
-                            let skip_note = if self.full_disk_access {
-                                "Full Disk Access is on, so nothing needs to be skipped. A folder you pick yourself is never skipped."
-                            } else {
-                                "Only while Full Disk Access is off. Skipped folders are listed in the status bar. A folder you pick yourself is never skipped."
-                            };
-                            setting_switch(ui, "Skip folders that would make macOS ask for permission", skip_note, &mut self.settings.skip_protected);
+                            if platform::PRIVACY_PROMPTS {
+                                let skip_note = if self.full_disk_access {
+                                    "Full Disk Access is on, so nothing needs to be skipped. A folder you pick yourself is never skipped."
+                                } else {
+                                    "Only while Full Disk Access is off. Skipped folders are listed in the status bar. A folder you pick yourself is never skipped."
+                                };
+                                setting_switch(ui, "Skip folders that would make macOS ask for permission", skip_note, &mut self.settings.skip_protected);
+                            }
                             setting_switch(
                                 ui,
                                 "Include other mounted volumes",
@@ -1653,12 +1659,16 @@ impl SpaceHogApp {
                                 }
                             });
                             if self.settings.ai_provider == Some(Provider::Codex) {
+                                let access = if platform::PRIVACY_PROMPTS {
+                                    "using this app's Full Disk Access"
+                                } else {
+                                    "with the same access as your account"
+                                };
                                 ui.label(
-                                    RichText::new(
+                                    RichText::new(format!(
                                         "Codex can't have its tools switched off. It runs in its read-only sandbox, but it \
-                                         can still look at files on your disk while answering, using this app's Full Disk \
-                                         Access.",
-                                    )
+                                         can still look at files on your disk while answering, {access}."
+                                    ))
                                     .font(body(13.0))
                                     .color(YELLOW),
                                 );
@@ -1680,7 +1690,7 @@ impl SpaceHogApp {
         }
         if relaunch {
             self.save_settings();
-            match settings::launch_new_instance() {
+            match platform::launch_new_instance() {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.message = Some((format!("Couldn't relaunch: {e}"), true)),
             }
@@ -2183,66 +2193,21 @@ fn group(n: u64) -> String {
 
 /// Path for display, with the home folder shown as `~`.
 fn tilde(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME")
+    if let Some(home) = platform::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
-        return if rest.as_os_str().is_empty() { "~".into() } else { format!("~/{}", rest.display()) };
+        return if rest.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+        };
     }
     path.display().to_string()
 }
 
-struct VolumeInfo {
-    free: u64,
-    total: u64,
-    mount: PathBuf,
-    fs_type: String,
-}
-
-impl VolumeInfo {
-    fn used_fraction(&self) -> f32 {
-        if self.total == 0 { 0.0 } else { 1.0 - self.free as f32 / self.total as f32 }
-    }
-}
-
-/// Space, mount point and file system of the volume holding `path`.
-fn volume_info(path: &Path) -> Option<VolumeInfo> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: c_path is a valid NUL-terminated string and stat is a valid out-pointer.
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
-        return None;
-    }
-    // SAFETY: statfs fills these as NUL-terminated C strings.
-    let mount = unsafe { std::ffi::CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_string_lossy().into_owned();
-    let fs_type = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_string_lossy().into_owned();
-    let block = stat.f_bsize as u64;
-    Some(VolumeInfo { free: stat.f_bavail * block, total: stat.f_blocks * block, mount: PathBuf::from(mount), fs_type })
-}
-
-/// The startup disk's name as Finder shows it, from the /Volumes entry
-/// that points back at `/`.
-fn startup_volume_name() -> String {
-    std::fs::read_dir("/Volumes")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .find(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == Path::new("/")))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Macintosh HD".to_string())
-}
-
-fn volume_display_name(mount: &Path, startup_name: &str) -> String {
-    if mount == Path::new("/") || mount == Path::new("/System/Volumes/Data") {
-        startup_name.to_string()
-    } else {
-        mount.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| mount.display().to_string())
-    }
-}
-
 fn root_crumbs(root: &Path, startup_name: &str) -> RootCrumbs {
-    let mount = volume_info(root).map(|v| v.mount).unwrap_or_else(|| PathBuf::from("/"));
-    let volume = volume_display_name(&mount, startup_name);
+    let mount = platform::volume_info(root).map(|v| v.mount).unwrap_or_else(platform::system_root);
+    let volume = platform::volume_display_name(&mount, startup_name);
     // Firmlinked paths like /Users live on the data volume but aren't under
     // its mount point, so fall back to the path from `/`.
     let rel = root.strip_prefix(&mount).or_else(|_| root.strip_prefix("/")).unwrap_or(root);
