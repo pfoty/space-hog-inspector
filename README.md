@@ -141,6 +141,8 @@ Terminal.
 | `src/app.rs` | The egui interface: toolbar, treemap, side panel, dialogs, Settings window |
 | `src/settings.rs` | Saved settings, Full Disk Access check, relaunch helpers |
 | `src/ai.rs` | Finding and asking the installed AI agent (Claude Code or Codex) |
+| `src/platform/` | Everything that differs by operating system: `macos.rs`, and `windows.rs` (a Windows port in progress, not yet tested on Windows) |
+| `assets/icon-256.png` | The app icon for the Windows window and taskbar |
 | `src/theme.rs` | Colours, fonts, egui styling, and the neon drawing helpers and controls |
 | `assets/fonts/` | Chakra Petch, Inter and JetBrains Mono, each with its SIL Open Font License (`OFL-*.txt`) |
 | `packaging/` | `bundle.sh`, `Info.plist`, and the icon generator |

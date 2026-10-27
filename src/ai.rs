@@ -8,7 +8,6 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform;
 use crate::scanner::{Node, format_size};
 
 /// Longest an agent may take before it is stopped.
@@ -67,22 +67,6 @@ impl Provider {
             Provider::Codex => "codex login",
         }
     }
-
-    /// Usual install locations. An app opened from Finder doesn't get the
-    /// shell's PATH, so these are checked directly.
-    fn candidates(self, home: Option<&Path>) -> Vec<PathBuf> {
-        let bin = self.binary();
-        let mut out = Vec::new();
-        if let Some(home) = home {
-            out.push(home.join(".local/bin").join(bin));
-            if self == Provider::Claude {
-                out.push(home.join(".claude/local/claude"));
-            }
-        }
-        out.push(Path::new("/opt/homebrew/bin").join(bin));
-        out.push(Path::new("/usr/local/bin").join(bin));
-        out
-    }
 }
 
 /// An installed agent.
@@ -92,38 +76,19 @@ pub struct Agent {
     pub exe: PathBuf,
 }
 
-/// Finds the installed agents: the usual locations first, then the user's
-/// login shell for installs elsewhere (for example under nvm).
+/// Finds the installed agents: the usual locations first, then the system's
+/// own lookup for installs elsewhere (for example under nvm).
 pub fn detect() -> Vec<Agent> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     Provider::ALL
         .into_iter()
         .filter_map(|provider| {
-            let exe = provider
-                .candidates(home.as_deref())
+            let exe = platform::agent_candidates(provider.binary())
                 .into_iter()
-                .find(|p| is_executable(p))
-                .or_else(|| from_login_shell(provider.binary()))?;
+                .find(|p| platform::is_executable(p))
+                .or_else(|| platform::find_with_shell(provider.binary()))?;
             Some(Agent { provider, exe })
         })
         .collect()
-}
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-fn from_login_shell(binary: &str) -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let out = Command::new(shell)
-        .args(["-lc", &format!("command -v {binary}")])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let line = String::from_utf8_lossy(&out.stdout).lines().last()?.trim().to_string();
-    let path = PathBuf::from(line);
-    (path.is_absolute() && is_executable(&path)).then_some(path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -267,8 +232,7 @@ pub fn ask(agent: &Agent, facts: &Facts, cancel: &AtomicBool) -> Result<Assessme
 
 /// An empty folder to run agents in, so they pick up no project files.
 fn work_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    let dir = PathBuf::from(home).join("Library/Caches/Space Hog Inspector/ai");
+    let dir = platform::app_cache_dir().ok_or("HOME is not set")?.join("ai");
     fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
     Ok(dir)
 }
@@ -276,15 +240,11 @@ fn work_dir() -> Result<PathBuf, String> {
 /// Runs `cmd` with `input` on stdin. Returns whether it exited cleanly, and
 /// its stdout and stderr.
 fn run(mut cmd: Command, agent: &Agent, dir: &Path, input: &str, cancel: &AtomicBool) -> Result<(bool, String, String), String> {
-    let mut path = agent.exe.parent().map(|p| p.display().to_string()).unwrap_or_default();
-    path += ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-    if let Ok(inherited) = std::env::var("PATH") {
-        path = format!("{path}:{inherited}");
-    }
     let name = agent.provider.label();
+    platform::hide_console(&mut cmd);
     let mut child = cmd
         .current_dir(dir)
-        .env("PATH", path)
+        .env("PATH", platform::agent_path(&agent.exe))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
